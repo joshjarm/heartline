@@ -1892,7 +1892,12 @@ impl App {
                 render::vtext("LAN RALLY", x, 130.0 * u, 64.0 * u, WHITE, -1);
                 text_left("A beat-locked paddle duel for two PCs on the same network.", x, 175.0 * u, 24.0 * u, pal.primary);
                 let song = self.juke.list.get(self.juke.idx).map(|p| track_title(p)).unwrap_or_default();
-                let items = vec![format!("HOST A MATCH   ({song})"), "JOIN A MATCH".to_string(), "BACK".to_string()];
+                let items = vec![
+                    format!("HOST A MATCH   ({song})"),
+                    "JOIN A MATCH".to_string(),
+                    format!("PRACTICE VS BOT   ({song})"),
+                    "BACK".to_string(),
+                ];
                 let act = menu_list(&items, &mut lan.sel, x, 260.0 * u, u, &self.rend, &self.audio);
                 let fy = sh - 150.0 * u;
                 text_left("The first time you host, Windows Firewall asks whether Heartline may use the network.", x, fy, 22.0 * u, pal.accent);
@@ -1905,7 +1910,20 @@ impl App {
                         lan.sel = 0;
                         lan.disc = Some(net::Discovery::start());
                     }
-                    Some(2) => leave = Some(None),
+                    Some(2) => {
+                        // Offline practice against the bot on the menu's current track.
+                        let cur = self.juke.list.get(self.juke.idx).cloned();
+                        if cur.is_some() {
+                            lan.host = true;
+                            lan.local = true;
+                            lan.stage = LanStage::Lobby;
+                            lan.set_song(cur);
+                            lan.note("local practice vs bot".into());
+                        } else {
+                            self.say("no track selected: pick one in the main menu first");
+                        }
+                    }
+                    Some(3) => leave = Some(None),
                     _ => {}
                 }
                 if esc {
