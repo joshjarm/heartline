@@ -3,9 +3,12 @@
 
 mod analysis;
 mod decode;
+mod display;
 mod engine;
 mod game;
 mod level;
+mod net;
+mod rally;
 mod render;
 mod rng;
 mod synth;
@@ -24,6 +27,7 @@ use decode::Track;
 use engine::{Audio, Sfx};
 use game::{Input, UpgradeId, World};
 use level::{Ev, Level, LevelEvent, LiveGen, Timeline};
+use rally::{Character, FxKind, Rally, RallyInput, RallyMusic};
 use render::{text_center, text_left, text_shadow, text_w, HudInfo, Renderer};
 
 // ---------------------------------------------------------------------------------------------
@@ -61,6 +65,12 @@ pub struct Args {
     screen: String,
     live_in: String,
     live_out: String,
+    /// LAN test: host a Rally match with this song.
+    lan_host: Option<PathBuf>,
+    /// LAN test: join the host at this IP (optionally `ip:port`).
+    lan_join: Option<String>,
+    /// LAN test: the local Rally player is the bot (auto character, auto ready).
+    rally_bot: bool,
 }
 
 fn parse_args() -> Args {
@@ -106,6 +116,9 @@ fn parse_args() -> Args {
             }
             "--screen" => a.screen = val(),
             "--live" => a.live = true,
+            "--lan-host" => a.lan_host = Some(PathBuf::from(val())),
+            "--lan-join" => a.lan_join = Some(val()),
+            "--rally-bot" => a.rally_bot = true,
             "--size" => {
                 let v = val();
                 let mut p = v.split('x');
@@ -241,6 +254,8 @@ fn spawn_loader(idx: usize, path: PathBuf, seed: u64, diff: f32) -> Loader {
 enum Screen {
     Menu,
     LiveSetup,
+    /// LAN Rally: host/join, lobby, countdown, match and results (`App::lan` holds the stage).
+    Lan,
     Play,
     Paused,
     Results,
@@ -283,6 +298,8 @@ struct LiveRun {
 }
 
 const DIFFS: [(f32, &str); 3] = [(0.65, "CHILL  (no-fail)"), (1.0, "NORMAL"), (1.35, "HARD")];
+/// Menu VISUALS setting: scale of the renderer's music-reactive pulse layer.
+const VISUALS: [(f32, &str); 3] = [(1.0, "FULL"), (0.45, "SUBTLE"), (0.0, "OFF")];
 
 struct App {
     args: Args,
@@ -307,6 +324,8 @@ struct App {
     juke: Jukebox,
     autofire: bool,
     fullscreen: bool,
+    /// Index into `VISUALS`.
+    visuals: usize,
     menu_sel: usize,
     dialog: Option<Receiver<Vec<PathBuf>>>,
     /// True when the open folder dialog is choosing the music library (not starting a run).
@@ -327,6 +346,8 @@ struct App {
     max_bullets: usize,
     max_enemies: usize,
     log: Vec<String>,
+    /// LAN Rally session (Some while `screen == Screen::Lan`).
+    lan: Option<Box<Lan>>,
 }
 
 /// Built-in synthesised tracks travel through playlists as pseudo paths ("::theme0").
@@ -435,6 +456,20 @@ fn feat_at(an: &Analysis, t: f32) -> Feat {
     Feat::lerp(&an.feats[i], &an.feats[j], x.fract())
 }
 
+/// Seconds from `t` until the next section that steps UP into Intense / Drop (infinite if none).
+/// The renderer builds tension over the bars before it and releases it on the downbeat.
+fn next_build(an: &Analysis, t: f32) -> f32 {
+    let big = |k: SectionKind| matches!(k, SectionKind::Intense | SectionKind::Drop);
+    let mut prev_big = false;
+    for s in &an.sections {
+        if s.t0 > t + 0.02 && big(s.kind) && !prev_big {
+            return s.t0 - t;
+        }
+        prev_big = big(s.kind);
+    }
+    f32::INFINITY
+}
+
 fn beat_pos(beats: &[f32], t: f32) -> f32 {
     let n = beats.len();
     if n < 2 {
@@ -460,15 +495,39 @@ impl App {
         self.message_t = 5.0;
     }
 
+    /// Hand the renderer this frame's audible waveform window and the time to the next big
+    /// section (file / menu playback only; live mode gets neither).
+    fn feed_signal(&mut self) {
+        self.rend.fx = VISUALS[self.visuals].0;
+        let t = self.world.t;
+        let src = if self.live.is_some() {
+            None
+        } else if matches!(self.screen, Screen::Play | Screen::Paused) {
+            match (self.phase, self.song.as_ref()) {
+                (Phase::Song, Some(s)) => Some((&s.track, &s.an)),
+                _ => None,
+            }
+        } else if self.juke.playing {
+            self.juke.loaded.as_ref().map(|(_, l)| (&l.track, &l.an))
+        } else {
+            None
+        };
+        match src {
+            Some((tr, an)) => self.rend.feed_signal(Some((&tr.samples, tr.sr)), t, next_build(an, t)),
+            None => self.rend.feed_signal(None, t, f32::INFINITY),
+        }
+    }
+
     fn save_settings(&self) {
         if self.args.selftest.is_some() {
             return;
         }
         let Some(path) = settings_path() else { return };
         let mut text = format!(
-            "diff={}\nvolume={:.2}\nsfx={:.2}\noffset_ms={:.0}\nautofire={}\n",
-            self.diff, self.volume, self.sfx_volume, self.offset_ms, self.autofire as u8
+            "diff={}\nvolume={:.2}\nsfx={:.2}\noffset_ms={:.0}\nautofire={}\nfullscreen={}\n",
+            self.diff, self.volume, self.sfx_volume, self.offset_ms, self.autofire as u8, self.fullscreen as u8
         );
+        text.push_str(&format!("visuals={}\n", self.visuals));
         if let Some(d) = &self.music_dir {
             text.push_str(&format!("music_dir={}\n", d.display()));
         }
@@ -1066,6 +1125,1003 @@ fn hud_progress(t: f32, dur: f32) -> f32 {
 }
 
 // ---------------------------------------------------------------------------------------------
+// LAN Rally: lobby and match flow (sockets, protocol and threads live in net.rs)
+// ---------------------------------------------------------------------------------------------
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum LanStage {
+    Choose,
+    Join,
+    Lobby,
+    Countdown,
+    Match,
+    Results,
+}
+
+/// Inputs (client) and snapshots (host) go out at this fixed rate, whatever the frame rate.
+const LAN_SEND_DT: f32 = 1.0 / 60.0;
+const LAN_COUNTDOWN: f64 = 3.0;
+const LAN_HIST: usize = 128;
+const CHAR_DESC: [&str; 4] = [
+    "bass: perfect returns slam the other player back",
+    "snare: perfect returns split the orb in two",
+    "hat: perfect returns zig-zag every half beat",
+    "lead: perfect returns curve and leave a laser trail",
+];
+
+struct LanMatch {
+    track: Arc<Track>,
+    an: Arc<Analysis>,
+    events: Vec<LevelEvent>,
+    beats: Vec<f32>,
+    bars: Vec<f32>,
+    duration: f32,
+    cursor: usize,
+    /// Song time of this frame (negative during the countdown).
+    t: f32,
+    /// Local `net::now()` at which both PCs start the song.
+    start_local: f64,
+    audio_on: bool,
+    /// Host: the authoritative state. Client: the latest snapshot.
+    rally: Rally,
+    /// Client: the snapshot before `rally`, and the interpolated + predicted state that is drawn.
+    prev: Rally,
+    view: Rally,
+    prev_at: f64,
+    cur_at: f64,
+    snaps: u32,
+    bad_snaps: u32,
+    snap_t: f32,
+    buf: Vec<u8>,
+    send_acc: f32,
+    // host: the client's latest input
+    peer_in: RallyInput,
+    peer_swings: u8,
+    peer_pulse: bool,
+    peer_seq: u32,
+    // client: own inputs, kept until the host acknowledges them
+    seq: u32,
+    swings: u8,
+    down: bool,
+    ack: u32,
+    hist: VecDeque<(u32, RallyInput, f32)>,
+    fx_seen: f32,
+    score_seen: [u32; 2],
+    confirm: bool,
+    traffic0: (u64, u64),
+    wall0: f64,
+}
+
+struct Lan {
+    host: bool,
+    stage: LanStage,
+    net: Option<net::Net>,
+    disc: Option<net::Discovery>,
+    sel: usize,
+    ip: String,
+    my_ip: String,
+    status: String,
+    peer: String,
+    connected: bool,
+    my_char: u8,
+    peer_char: u8,
+    my_ready: bool,
+    peer_ready: bool,
+    /// Host: the chosen song. Client: the received file (or built-in theme path).
+    song: Option<PathBuf>,
+    song_title: String,
+    /// Host: the song last sent to the client, and whether it has fully gone out.
+    sent: Option<PathBuf>,
+    song_sent: bool,
+    xfer: (u64, u64),
+    loader: Option<(PathBuf, Loader)>,
+    loaded: Option<(PathBuf, Loaded)>,
+    peer_loaded: bool,
+    told_loaded: bool,
+    /// (offset = host clock - local clock, best RTT, samples)
+    clock: (f64, f64, u32),
+    dialog: Option<Receiver<Vec<PathBuf>>>,
+    m: Option<Box<LanMatch>>,
+    result: [u32; 2],
+    result_t: f32,
+    log_path: Option<PathBuf>,
+    log: Vec<String>,
+}
+
+impl Lan {
+    fn new(log_dir: Option<&Path>) -> Lan {
+        Lan {
+            host: false,
+            stage: LanStage::Choose,
+            net: None,
+            disc: None,
+            sel: 0,
+            ip: String::new(),
+            my_ip: String::new(),
+            status: String::new(),
+            peer: String::new(),
+            connected: false,
+            my_char: 0,
+            peer_char: 0,
+            my_ready: false,
+            peer_ready: false,
+            song: None,
+            song_title: String::new(),
+            sent: None,
+            song_sent: false,
+            xfer: (0, 0),
+            loader: None,
+            loaded: None,
+            peer_loaded: false,
+            told_loaded: false,
+            clock: (0.0, 0.0, 0),
+            dialog: None,
+            m: None,
+            result: [0; 2],
+            result_t: 0.0,
+            log_path: log_dir.map(|d| d.join("lan.log")),
+            log: Vec::new(),
+        }
+    }
+
+    /// Record a state change (selftest runs write them to `lan.log`).
+    fn note(&mut self, s: String) {
+        if let Some(p) = &self.log_path {
+            self.log.push(format!("{:9.3} {} {}", net::now(), if self.host { "host" } else { "client" }, s));
+            let _ = std::fs::write(p, self.log.join("\n") + "\n");
+        }
+    }
+
+    fn send(&self, m: &net::Msg) {
+        if let Some(n) = &self.net {
+            n.send(m);
+        }
+    }
+
+    fn send_lobby(&self) {
+        self.send(&net::Msg::Lobby { ch: self.my_char, ready: self.my_ready });
+    }
+
+    fn in_match(&self) -> bool {
+        matches!(self.stage, LanStage::Countdown | LanStage::Match) && self.m.is_some()
+    }
+
+    fn set_song(&mut self, p: Option<PathBuf>) {
+        self.song_title = p.as_deref().map(track_title).unwrap_or_default();
+        self.song = p;
+    }
+
+    fn is_loaded(&self) -> bool {
+        matches!((&self.loaded, &self.song), (Some((a, _)), Some(b)) if a == b)
+    }
+}
+
+/// 0..1 build-up ramp before the next Intense / Drop section (same window as the renderer).
+fn build_ramp(an: &Analysis, t: f32) -> f32 {
+    let beat = if an.bpm > 1.0 { 60.0 / an.bpm } else { 0.5 };
+    let win = (16.0 * beat).clamp(3.0, 10.0);
+    (1.0 - next_build(an, t) / win).clamp(0.0, 1.0)
+}
+
+/// Local player's Rally input from keyboard / mouse. `aim` is a direction from the avatar.
+fn rally_input(rend: &Renderer, me_pos: Vec2) -> RallyInput {
+    let k = |a: KeyCode, b: KeyCode| (is_key_down(a) || is_key_down(b)) as i32 as f32;
+    let mv = vec2(k(KeyCode::D, KeyCode::Right) - k(KeyCode::A, KeyCode::Left), k(KeyCode::S, KeyCode::Down) - k(KeyCode::W, KeyCode::Up));
+    let (mx, my) = mouse_position();
+    let aim = rend.view.to_world(vec2(mx, my)) - me_pos;
+    RallyInput { mv, aim, swing: is_mouse_button_down(MouseButton::Left) || is_key_down(KeyCode::Space) }
+}
+
+impl App {
+    fn lan_open(&mut self) {
+        self.lan = Some(Box::new(Lan::new(self.args.selftest.as_deref())));
+        self.screen = Screen::Lan;
+    }
+
+    /// Leave the LAN session (dropping `Net` tells the other side) and go back to the menu.
+    fn lan_leave(&mut self, why: Option<String>) {
+        if let Some(mut lan) = self.lan.take() {
+            lan.note(format!("leave: {}", why.as_deref().unwrap_or("by choice")));
+        }
+        self.to_menu();
+        if let Some(w) = why {
+            self.say(w);
+        }
+    }
+
+    fn lan_start_host(&mut self, lan: &mut Lan, song: Option<PathBuf>) {
+        match net::Net::host(&net::local_name(), net::TCP_PORT, true) {
+            Ok(n) => {
+                let port = n.port;
+                lan.host = true;
+                lan.net = Some(n);
+                lan.disc = None;
+                lan.stage = LanStage::Lobby;
+                lan.my_ip = net::local_ip().map(|i| i.to_string()).unwrap_or_else(|| "unknown".into());
+                let song = song.or_else(|| self.juke.list.get(self.juke.idx).cloned());
+                lan.set_song(song);
+                lan.note(format!("hosting port={port} song='{}'", lan.song_title));
+            }
+            Err(e) => {
+                lan.note(format!("host failed: {e}"));
+                self.say(e);
+            }
+        }
+    }
+
+    fn lan_start_join(&mut self, lan: &mut Lan, addr: std::net::SocketAddr) {
+        lan.host = false;
+        lan.net = Some(net::Net::join(addr, &net::local_name()));
+        lan.disc = None;
+        lan.stage = LanStage::Lobby;
+        lan.note(format!("joining {addr}"));
+    }
+
+    /// Command-line LAN start (`--lan-host FILE` / `--lan-join IP`).
+    fn lan_cli(&mut self) {
+        self.lan_open();
+        let Some(mut lan) = self.lan.take() else { return };
+        if let Some(f) = self.args.lan_host.clone() {
+            self.lan_start_host(&mut lan, Some(f));
+        } else if let Some(ip) = self.args.lan_join.clone() {
+            match net::parse_addr(&ip) {
+                Some(a) => self.lan_start_join(&mut lan, a),
+                None => self.say(format!("not an IP address: {ip}")),
+            }
+        }
+        self.lan = Some(lan);
+    }
+
+    /// Make sure `path` is analysed (reusing the menu's copy when it is the same track).
+    fn lan_load(&mut self, lan: &mut Lan, path: PathBuf) {
+        if lan.loaded.as_ref().map(|l| &l.0) == Some(&path) || lan.loader.as_ref().map(|l| &l.0) == Some(&path) {
+            return;
+        }
+        if let Some((p, l)) = &self.juke.loaded {
+            if *p == path {
+                let level = level::generate(&l.an, self.args.seed, self.diff());
+                lan.loaded = Some((path, Loaded { track: l.track.clone(), an: l.an.clone(), level }));
+                lan.loader = None;
+                return;
+            }
+        }
+        lan.loader = Some((path.clone(), spawn_loader(0, path, self.args.seed, self.diff())));
+    }
+
+    /// Per-frame LAN housekeeping on every LAN screen: network events, song loading, start.
+    fn lan_poll(&mut self, dt: f32) {
+        let Some(mut lan) = self.lan.take() else { return };
+        let mut leave: Option<String> = None;
+        if let Some(d) = &mut lan.disc {
+            d.poll(dt);
+        }
+        while leave.is_none() {
+            let Some(ev) = lan.net.as_ref().and_then(|n| n.poll()) else { break };
+            match ev {
+                net::Event::Status(s) => lan.status = s,
+                net::Event::Connected(name) => {
+                    lan.connected = true;
+                    lan.status = format!("connected to {name}");
+                    lan.note(format!("connected peer={name}"));
+                    lan.peer = name;
+                    if self.args.rally_bot {
+                        lan.my_char = if lan.host { 1 } else { 3 };
+                        lan.my_ready = true;
+                        lan.note(format!("ready char={}", lan.my_char));
+                    }
+                    lan.send_lobby();
+                }
+                net::Event::Msg(m) => self.lan_msg(&mut lan, m, &mut leave),
+                net::Event::SongProgress(d, t) => lan.xfer = (d, t),
+                net::Event::SongSaved { path, title, theme } => {
+                    let p = path.or_else(|| ((theme as usize) < synth::THEME_COUNT).then(|| theme_path(theme as usize)));
+                    match p {
+                        Some(p) => {
+                            lan.note(format!("song received '{title}'"));
+                            lan.song_title = title;
+                            lan.song = Some(p.clone());
+                            lan.loaded = None;
+                            lan.loader = None;
+                            lan.told_loaded = false;
+                            self.lan_load(&mut lan, p);
+                        }
+                        None => leave = Some("the host picked a song this version does not have".into()),
+                    }
+                }
+                net::Event::SongSent => {
+                    lan.song_sent = true;
+                    lan.note(format!("song sent bytes={}", lan.xfer.1));
+                }
+                net::Event::Clock { offset, rtt, samples } => lan.clock = (offset, rtt, samples),
+                net::Event::Disconnected(why) => leave = Some(why),
+            }
+        }
+        // song analysis
+        let mut done = None;
+        if let Some((p, l)) = &lan.loader {
+            if let Ok(r) = l.rx.try_recv() {
+                done = Some((p.clone(), r));
+            }
+        }
+        if let Some((p, r)) = done {
+            lan.loader = None;
+            match r {
+                Ok(l) => {
+                    lan.note(format!("song analysed beats={} bpm={:.1}", l.an.beats.len(), l.an.bpm));
+                    lan.loaded = Some((p, l));
+                }
+                Err(e) if lan.host => {
+                    self.say(format!("cannot read that song: {e}"));
+                    lan.set_song(None);
+                    lan.my_ready = false;
+                    lan.send_lobby();
+                }
+                Err(e) => leave = Some(format!("could not read the host's song: {e}")),
+            }
+        }
+        if let Some(why) = leave {
+            self.lan = Some(lan);
+            self.lan_leave(Some(why));
+            return;
+        }
+        if lan.host {
+            if let Some(s) = lan.song.clone() {
+                self.lan_load(&mut lan, s);
+            }
+            // The song goes out once the host locks in with Ready.
+            if lan.connected && lan.my_ready && lan.sent != lan.song {
+                if let (Some(s), Some(n)) = (lan.song.clone(), &lan.net) {
+                    match theme_index(&s) {
+                        Some(i) => n.send_song(None, &lan.song_title, i as u8, ""),
+                        None => {
+                            let ext = s.extension().and_then(|e| e.to_str()).unwrap_or("").to_ascii_lowercase();
+                            n.send_song(Some(s.clone()), &lan.song_title, net::NO_THEME, &ext);
+                        }
+                    }
+                    lan.sent = Some(s);
+                    lan.song_sent = false;
+                    lan.peer_loaded = false;
+                    lan.xfer = (0, 0);
+                    lan.note(format!("sending song '{}'", lan.song_title));
+                }
+            }
+            let go = lan.stage == LanStage::Lobby
+                && lan.connected
+                && lan.my_ready
+                && lan.peer_ready
+                && lan.song_sent
+                && lan.peer_loaded
+                && lan.sent == lan.song
+                && lan.is_loaded();
+            if go {
+                let seed = if self.args.seed != 0 {
+                    self.args.seed
+                } else {
+                    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos() as u64).unwrap_or(9)
+                };
+                let chars = [lan.my_char, lan.peer_char];
+                let host_time = net::now() + LAN_COUNTDOWN;
+                lan.send(&net::Msg::Start { host_time, seed, chars });
+                lan.note(format!("start host_time={host_time:.3} seed={seed} chars={chars:?}"));
+                self.lan_begin(&mut lan, host_time, seed, chars);
+            }
+        } else if !lan.told_loaded && lan.is_loaded() && lan.clock.2 >= net::SYNC_SAMPLES as u32 {
+            lan.send(&net::Msg::Loaded);
+            lan.told_loaded = true;
+            lan.note(format!("loaded; clock offset={:.4}s rtt={:.2}ms", lan.clock.0, lan.clock.1 * 1000.0));
+        }
+        if lan.stage == LanStage::Results {
+            lan.result_t += dt;
+            if self.args.rally_bot && self.args.selftest.is_none() && lan.result_t > 5.0 {
+                lan_to_lobby(&mut lan, true);
+            }
+        }
+        self.lan = Some(lan);
+    }
+
+    fn lan_msg(&mut self, lan: &mut Lan, m: net::Msg, leave: &mut Option<String>) {
+        use net::Msg;
+        match m {
+            Msg::Lobby { ch, ready } => {
+                let ch = ch.min(Character::ALL.len() as u8 - 1);
+                if (ch, ready) != (lan.peer_char, lan.peer_ready) {
+                    lan.note(format!("peer char={ch} ready={ready}"));
+                }
+                lan.peer_char = ch;
+                lan.peer_ready = ready;
+            }
+            Msg::Loaded if lan.host => {
+                lan.peer_loaded = true;
+                lan.note("peer loaded".into());
+            }
+            Msg::Start { host_time, seed, chars } if !lan.host => {
+                if !lan.is_loaded() {
+                    *leave = Some("the host started before the song was ready".into());
+                    return;
+                }
+                let local = host_time - lan.clock.0;
+                lan.note(format!(
+                    "start host_time={host_time:.3} local={local:.3} in={:.3}s offset={:.4} rtt={:.2}ms seed={seed} chars={chars:?}",
+                    local - net::now(),
+                    lan.clock.0,
+                    lan.clock.1 * 1000.0
+                ));
+                self.lan_begin(lan, local, seed, chars);
+            }
+            Msg::Input(i) if lan.host => {
+                if let Some(m) = &mut lan.m {
+                    if i.seq > m.peer_seq {
+                        m.peer_seq = i.seq;
+                        m.peer_in = RallyInput { mv: vec2(i.mv[0], i.mv[1]), aim: vec2(i.aim[0], i.aim[1]), swing: false };
+                        if i.swings != m.peer_swings {
+                            m.peer_swings = i.swings;
+                            m.peer_pulse = true;
+                        }
+                    }
+                }
+            }
+            Msg::Snap { t, ack, data } if !lan.host => {
+                if let Some(m) = &mut lan.m {
+                    std::mem::swap(&mut m.prev, &mut m.rally);
+                    if m.rally.decode(&data) {
+                        m.prev_at = m.cur_at;
+                        m.cur_at = net::now();
+                        m.snaps += 1;
+                        m.snap_t = t;
+                        m.ack = ack;
+                        while m.hist.front().is_some_and(|h| h.0 <= ack) {
+                            m.hist.pop_front();
+                        }
+                        if m.snaps == 1 {
+                            m.prev.clone_from(&m.rally);
+                        }
+                    } else {
+                        std::mem::swap(&mut m.prev, &mut m.rally);
+                        m.bad_snaps += 1;
+                    }
+                }
+                if let Some(n) = &lan.net {
+                    n.recycle(data);
+                }
+            }
+            Msg::End { score } if !lan.host => self.lan_end(lan, score),
+            Msg::Snap { data, .. } => {
+                if let Some(n) = &lan.net {
+                    n.recycle(data);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Countdown: both PCs start the song at `start_local` on their own clock.
+    fn lan_begin(&mut self, lan: &mut Lan, start_local: f64, seed: u64, chars: [u8; 2]) {
+        let Some((_, l)) = &lan.loaded else { return };
+        let ch = |i: u8| Character::from_index(i).unwrap_or(Character::Sub);
+        let rally = Rally::new(seed, [ch(chars[0]), ch(chars[1])]);
+        let an = l.an.clone();
+        let bars: Vec<f32> = if an.beats.is_empty() { Vec::new() } else { an.beats[an.downbeat.min(an.beats.len() - 1)..].iter().step_by(4).copied().collect() };
+        let beat_len = if l.level.bpm > 1.0 { 60.0 / l.level.bpm } else { 0.5 };
+        let traffic0 = lan.net.as_ref().map(|n| n.traffic()).unwrap_or_default();
+        let m = LanMatch {
+            track: l.track.clone(),
+            events: l.level.events.clone(),
+            beats: an.beats.clone(),
+            bars,
+            duration: an.duration.max(1.0),
+            an,
+            cursor: 0,
+            t: (net::now() - start_local) as f32,
+            start_local,
+            audio_on: false,
+            prev: rally.clone(),
+            view: rally.clone(),
+            rally,
+            prev_at: 0.0,
+            cur_at: 0.0,
+            snaps: 0,
+            bad_snaps: 0,
+            snap_t: 0.0,
+            buf: Vec::with_capacity(1024),
+            send_acc: 0.0,
+            peer_in: RallyInput::default(),
+            peer_swings: 0,
+            peer_pulse: false,
+            peer_seq: 0,
+            seq: 0,
+            swings: 0,
+            down: false,
+            ack: 0,
+            hist: VecDeque::with_capacity(LAN_HIST),
+            fx_seen: -1.0e9,
+            score_seen: [0; 2],
+            confirm: false,
+            traffic0,
+            wall0: net::now(),
+        };
+        lan.m = Some(Box::new(m));
+        lan.stage = LanStage::Countdown;
+        self.juke.playing = false;
+        self.audio.fade_out(0.4);
+        self.world = World::new(self.diff(), true);
+        self.world.beat_len = beat_len;
+    }
+
+    fn lan_end(&mut self, lan: &mut Lan, score: [u32; 2]) {
+        lan.result = score;
+        lan.result_t = 0.0;
+        lan.stage = LanStage::Results;
+        lan.my_ready = false;
+        lan.peer_ready = false;
+        self.audio.fade_out(1.0);
+        if let Some(m) = lan.m.take() {
+            let secs = (net::now() - m.wall0).max(0.001);
+            let (s0, r0) = m.traffic0;
+            let (s1, r1) = lan.net.as_ref().map(|n| n.traffic()).unwrap_or((s0, r0));
+            lan.note(format!(
+                "match over t={:.2} snapshot_score={}-{} snaps={} bad_snaps={} up={:.1}KB/s down={:.1}KB/s",
+                m.t,
+                m.rally.score()[0],
+                m.rally.score()[1],
+                m.snaps,
+                m.bad_snaps,
+                (s1 - s0) as f64 / secs / 1024.0,
+                (r1 - r0) as f64 / secs / 1024.0
+            ));
+        }
+        lan.note(format!("final score {}-{}", score[0], score[1]));
+        lan.send_lobby();
+    }
+
+    /// Countdown and match: host steps Rally, client predicts + interpolates. Returns progress.
+    fn lan_step(&mut self, dt: f32) -> f32 {
+        let Some(mut lan) = self.lan.take() else { return 0.0 };
+        let host = lan.host;
+        let me = if host { 0 } else { 1 };
+        let now = net::now();
+        let mut notes: [Option<String>; 2] = [None, None];
+        let mut end_score = None;
+        let progress;
+        {
+            let Some(mb) = lan.m.as_mut() else {
+                self.lan = Some(lan);
+                return 0.0;
+            };
+            let m: &mut LanMatch = mb;
+            if !m.audio_on && now >= m.start_local {
+                let late = now - m.start_local;
+                self.audio.set_volume(if self.args.mute { 0.0 } else { self.volume });
+                self.audio.play_ex(m.track.clone(), late, false, 0.0);
+                m.audio_on = true;
+                notes[0] = Some(format!("audio start late={:.2}ms", late * 1000.0));
+            }
+            let t = if m.audio_on {
+                let a = self.audio.song_time() as f32 - self.offset_ms / 1000.0;
+                a.max(m.t).min(m.t + 0.25)
+            } else {
+                (now - m.start_local) as f32
+            };
+            m.t = t;
+            let tt = t.max(0.0);
+            let playing = m.audio_on && t >= 0.0;
+            let section = m.an.section_at(tt).map(|s| s.kind).unwrap_or(SectionKind::Normal);
+            let music = RallyMusic { beats: &m.beats, bars: &m.bars, section, next_build: build_ramp(&m.an, tt) };
+            let mine = if host { &m.rally } else { &m.view };
+            let mut inp = if self.args.rally_bot { mine.bot_input(me, t, &music) } else { rally_input(&self.rend, mine.players[me].pos) };
+            if !playing || m.confirm {
+                inp = RallyInput { aim: inp.aim, ..RallyInput::default() };
+            }
+            if host {
+                if playing {
+                    let mut pin = m.peer_in;
+                    pin.swing = m.peer_pulse;
+                    m.peer_pulse = false;
+                    m.rally.step(dt, t, [inp, pin], &music);
+                }
+                m.send_acc += dt;
+                let over = playing && (self.audio.finished() || t >= m.duration - 0.05);
+                let test_over = self.args.selftest.is_some() && self.wall >= self.args.secs - 4.0;
+                if m.send_acc >= LAN_SEND_DT || over || test_over {
+                    m.send_acc = (m.send_acc - LAN_SEND_DT).clamp(0.0, LAN_SEND_DT);
+                    m.buf.clear();
+                    m.rally.encode(&mut m.buf);
+                    if let Some(n) = &lan.net {
+                        n.send_snap(t, m.peer_seq, &m.buf);
+                    }
+                }
+                if over || test_over {
+                    let score = m.rally.score();
+                    if let Some(n) = &lan.net {
+                        n.send(&net::Msg::End { score });
+                    }
+                    end_score = Some(score);
+                }
+            } else {
+                // Swing presses are counted, so one is never lost between 60 Hz input packets.
+                if inp.swing && !m.down {
+                    m.swings = m.swings.wrapping_add(1);
+                }
+                m.down = inp.swing;
+                m.send_acc += dt;
+                if m.send_acc >= LAN_SEND_DT {
+                    m.send_acc = (m.send_acc - LAN_SEND_DT).clamp(0.0, LAN_SEND_DT);
+                    let q = |v: f32| (v.clamp(-1.0, 1.0) * 127.0).round() / 127.0;
+                    let sent = RallyInput { mv: vec2(q(inp.mv.x), q(inp.mv.y)), aim: inp.aim, swing: false };
+                    m.seq += 1;
+                    if let Some(n) = &lan.net {
+                        n.send(&net::Msg::Input(net::NetInput { seq: m.seq, mv: [sent.mv.x, sent.mv.y], aim: [sent.aim.x, sent.aim.y], swings: m.swings }));
+                    }
+                    if m.hist.len() >= LAN_HIST {
+                        m.hist.pop_front();
+                    }
+                    m.hist.push_back((m.seq, sent, LAN_SEND_DT));
+                }
+                // Draw one snapshot behind (interpolated), with our own avatar predicted.
+                if m.snaps >= 2 {
+                    let span = (m.cur_at - m.prev_at).clamp(0.004, 0.1);
+                    m.view.interpolate(&m.prev, &m.rally, ((now - m.cur_at) / span) as f32);
+                } else {
+                    m.view.clone_from(&m.rally);
+                }
+                if playing && m.snaps > 0 {
+                    m.view.players[me] = m.rally.players[me];
+                    for (s, i, d) in m.hist.iter() {
+                        if *s > m.ack {
+                            m.view.predict_move(me, *d, i);
+                        }
+                    }
+                    m.view.predict_move(me, m.send_acc, &inp);
+                }
+            }
+            // Sounds and screen kicks for new Rally events.
+            let shown = if host { &m.rally } else { &m.view };
+            let mut newest = m.fx_seen;
+            for f in shown.events() {
+                if f.t <= m.fx_seen {
+                    continue;
+                }
+                newest = newest.max(f.t);
+                let pan = (f.pos.x / level::HALF_W).clamp(-1.0, 1.0);
+                match f.kind {
+                    FxKind::Hit => self.audio.sfx(Sfx::NoteShot, 0.6, pan),
+                    FxKind::Perfect => self.audio.sfx(Sfx::Shard, 0.9, pan),
+                    FxKind::Slam => {
+                        self.audio.sfx(Sfx::Slam, 1.0, pan);
+                        self.world.shake = self.world.shake.max(0.6);
+                    }
+                    FxKind::Split => self.audio.sfx(Sfx::Kill, 0.7, pan),
+                    FxKind::Score => {
+                        self.audio.sfx(Sfx::HeartBreak, 0.9, pan);
+                        self.world.shake = self.world.shake.max(0.8);
+                        self.world.flash = self.world.flash.max(0.5);
+                    }
+                    FxKind::Serve => self.audio.sfx(Sfx::UiMove, 0.4, pan),
+                    FxKind::Bounce => {}
+                }
+            }
+            m.fx_seen = newest;
+            let sc = m.rally.score();
+            if sc != m.score_seen {
+                m.score_seen = sc;
+                notes[1] = Some(if host {
+                    format!("point t={:.3} score {}-{}", m.rally.t, sc[0], sc[1])
+                } else {
+                    format!("point host_t={:.3} local_t={:.3} score {}-{}", m.snap_t, t, sc[0], sc[1])
+                });
+            }
+            // The visual layer reacts to the music exactly like the menu: beats, hits, sections.
+            while m.cursor < m.events.len() && m.events[m.cursor].at() <= tt {
+                let e = m.events[m.cursor];
+                m.cursor += 1;
+                if matches!(e.ev, Ev::Beat { .. } | Ev::Hit { .. } | Ev::Section { .. }) {
+                    self.world.apply(&e);
+                }
+            }
+            self.world.t = tt;
+            let feat = if playing { feat_at(&m.an, tt) } else { Feat::default() };
+            let bp = beat_pos(&m.beats, tt);
+            self.world.update(dt, tt, &Input::default(), bp, &feat, m.an.intensity_at(tt), false);
+            self.world.player.pos = Vec2::ZERO;
+            if m.audio_on && lan.stage == LanStage::Countdown {
+                lan.stage = LanStage::Match;
+            }
+            progress = tt / m.duration;
+        }
+        for n in notes.iter_mut() {
+            if let Some(s) = n.take() {
+                lan.note(s);
+            }
+        }
+        if let Some(sc) = end_score {
+            self.lan_end(&mut lan, sc);
+        }
+        self.lan = Some(lan);
+        progress
+    }
+
+    fn lan_draw(&mut self, dt: f32) {
+        let Some(lan) = self.lan.as_ref() else { return };
+        let Some(m) = lan.m.as_ref() else { return };
+        let me = if lan.host { 0 } else { 1 };
+        self.rend.fx = VISUALS[self.visuals].0;
+        let t = m.t.max(0.0);
+        if m.audio_on {
+            self.rend.feed_signal(Some((&m.track.samples, m.track.sr)), t, next_build(&m.an, t));
+        } else {
+            self.rend.feed_signal(None, t, f32::INFINITY);
+        }
+        let r = if lan.host { &m.rally } else { &m.view };
+        self.rend.draw_rally(r, &self.world, me, dt);
+    }
+
+    /// LAN screens (drawn over the scene) and their input.
+    fn lan_ui(&mut self, u: f32, sw: f32, sh: f32) {
+        let Some(mut lan) = self.lan.take() else {
+            self.screen = Screen::Menu;
+            return;
+        };
+        let pal = self.rend.pal;
+        let x = 110.0 * u;
+        let esc = is_key_pressed(KeyCode::Escape);
+        let enter = is_key_pressed(KeyCode::Enter) || is_key_pressed(KeyCode::KpEnter);
+        let mut leave: Option<Option<String>> = None;
+        let soft = Color::new(1.0, 1.0, 1.0, 0.7);
+        match lan.stage {
+            LanStage::Choose => {
+                dim(0.6);
+                render::vtext("LAN RALLY", x, 130.0 * u, 64.0 * u, WHITE, -1);
+                text_left("A beat-locked paddle duel for two PCs on the same network.", x, 175.0 * u, 24.0 * u, pal.primary);
+                let song = self.juke.list.get(self.juke.idx).map(|p| track_title(p)).unwrap_or_default();
+                let items = vec![format!("HOST A MATCH   ({song})"), "JOIN A MATCH".to_string(), "BACK".to_string()];
+                let act = menu_list(&items, &mut lan.sel, x, 260.0 * u, u, &self.rend, &self.audio);
+                let fy = sh - 150.0 * u;
+                text_left("The first time you host, Windows Firewall asks whether Heartline may use the network.", x, fy, 22.0 * u, pal.accent);
+                text_left("Allow it on Private networks. Heartline never changes firewall settings itself.", x, fy + 28.0 * u, 22.0 * u, soft);
+                text_left("Both PCs must be on the same network. Ports: TCP 47820 (game), UDP 47821 (finding hosts).", x, fy + 56.0 * u, 22.0 * u, soft);
+                match act {
+                    Some(0) => self.lan_start_host(&mut lan, None),
+                    Some(1) => {
+                        lan.stage = LanStage::Join;
+                        lan.sel = 0;
+                        lan.disc = Some(net::Discovery::start());
+                    }
+                    Some(2) => leave = Some(None),
+                    _ => {}
+                }
+                if esc {
+                    leave = Some(None);
+                }
+            }
+            LanStage::Join => {
+                dim(0.6);
+                render::vtext("JOIN A MATCH", x, 130.0 * u, 64.0 * u, WHITE, -1);
+                let (hosts, err) = match &lan.disc {
+                    Some(d) => (d.hosts.clone(), d.error.clone()),
+                    None => (Vec::new(), None),
+                };
+                let msg = err.unwrap_or_else(|| if hosts.is_empty() { "looking for hosts on your network...".into() } else { "hosts on your network:".into() });
+                text_left(&msg, x, 175.0 * u, 24.0 * u, pal.primary);
+                while let Some(c) = get_char_pressed() {
+                    if (c.is_ascii_digit() || c == '.' || c == ':') && lan.ip.len() < 21 {
+                        lan.ip.push(c);
+                    }
+                }
+                if is_key_pressed(KeyCode::Backspace) {
+                    lan.ip.pop();
+                }
+                let mut items: Vec<String> = hosts
+                    .iter()
+                    .map(|h| format!("{}   {}{}", h.name, h.addr.ip(), if h.compatible { "" } else { "   (different version)" }))
+                    .collect();
+                items.push(format!("TYPE AN IP:   {}_", lan.ip));
+                items.push("BACK".to_string());
+                lan.sel = lan.sel.min(items.len() - 1);
+                let act = menu_list(&items, &mut lan.sel, x, 230.0 * u, u, &self.rend, &self.audio);
+                text_left("type the host's IP (shown on its lobby screen) and press ENTER on that row", x, sh - 90.0 * u, 22.0 * u, soft);
+                let nh = hosts.len();
+                match act {
+                    Some(i) if i < nh => {
+                        if hosts[i].compatible {
+                            self.lan_start_join(&mut lan, hosts[i].addr);
+                        } else {
+                            self.say("that host is on a different version of Heartline");
+                        }
+                    }
+                    Some(i) if i == nh => match net::parse_addr(&lan.ip) {
+                        Some(a) => self.lan_start_join(&mut lan, a),
+                        None => self.say("type an IP like 192.168.1.20"),
+                    },
+                    Some(_) => {
+                        lan.stage = LanStage::Choose;
+                        lan.disc = None;
+                    }
+                    None => {}
+                }
+                if esc {
+                    lan.stage = LanStage::Choose;
+                    lan.disc = None;
+                }
+            }
+            LanStage::Lobby => {
+                dim(0.62);
+                render::vtext(if lan.host { "HOSTING" } else { "LOBBY" }, x, 130.0 * u, 64.0 * u, WHITE, -1);
+                let line = if lan.host && !lan.connected {
+                    format!("your IP  {}   -   waiting for a player to join", lan.my_ip)
+                } else if lan.connected {
+                    format!("{}   -   ping {:.1} ms", lan.status, lan.clock.1 * 1000.0)
+                } else {
+                    lan.status.clone()
+                };
+                text_left(&line, x, 175.0 * u, 24.0 * u, pal.primary);
+                // player cards
+                let peer_name = if lan.connected { lan.peer.clone() } else { "waiting...".to_string() };
+                let cards = [("YOU", net::local_name(), lan.my_char, lan.my_ready, true), ("THEM", peer_name, lan.peer_char, lan.peer_ready, lan.connected)];
+                for (k, (who, name, ch, ready, on)) in cards.iter().enumerate() {
+                    let cx = x + k as f32 * 600.0 * u;
+                    let cy = 220.0 * u;
+                    draw_rectangle(cx, cy, 560.0 * u, 170.0 * u, Color::new(0.0, 0.0, 0.05, 0.5));
+                    draw_rectangle_lines(cx, cy, 560.0 * u, 170.0 * u, 2.0 * u, if *ready { pal.accent } else { Color::new(1.0, 1.0, 1.0, 0.25) });
+                    text_left(&format!("{who}   {name}"), cx + 20.0 * u, cy + 36.0 * u, 22.0 * u, soft);
+                    if *on {
+                        let c = Character::from_index(*ch).unwrap_or(Character::Sub);
+                        let label = if k == 0 && !*ready { format!("<  {}  >", c.name()) } else { c.name().to_string() };
+                        render::vtext(&label, cx + 20.0 * u, cy + 92.0 * u, 44.0 * u, WHITE, -1);
+                        text_left(CHAR_DESC[(*ch as usize).min(3)], cx + 20.0 * u, cy + 126.0 * u, 20.0 * u, pal.primary);
+                    }
+                    text_left(if *ready { "READY" } else { "not ready" }, cx + 20.0 * u, cy + 156.0 * u, 22.0 * u, if *ready { pal.accent } else { soft });
+                }
+                // song + progress
+                let mut y = 440.0 * u;
+                let title = if lan.song_title.is_empty() { "(none)".to_string() } else { lan.song_title.clone() };
+                text_left(&format!("SONG   {title}"), x, y, 28.0 * u, WHITE);
+                if lan.host && !lan.my_ready {
+                    text_left("Q / E  change track      O  open a file", x + 760.0 * u, y, 22.0 * u, soft);
+                }
+                let bar = |y: f32, label: &str, f: f32| {
+                    let w = 700.0 * u;
+                    text_left(label, x, y, 22.0 * u, soft);
+                    draw_rectangle(x + 300.0 * u, y - 16.0 * u, w, 18.0 * u, Color::new(0.0, 0.0, 0.05, 0.6));
+                    draw_rectangle(x + 300.0 * u, y - 16.0 * u, w * f.clamp(0.0, 1.0), 18.0 * u, pal.secondary);
+                };
+                y += 44.0 * u;
+                if lan.xfer.1 > 0 {
+                    let f = lan.xfer.0 as f32 / lan.xfer.1 as f32;
+                    let label = format!("{}  {:.1} / {:.1} MB", if lan.host { "SENDING SONG" } else { "RECEIVING SONG" }, lan.xfer.0 as f32 / 1048576.0, lan.xfer.1 as f32 / 1048576.0);
+                    bar(y, &label, f);
+                    y += 36.0 * u;
+                }
+                if let Some((_, l)) = &lan.loader {
+                    let p = l.progress.load(Ordering::Relaxed) as f32 / 1000.0;
+                    let label = if l.stage.load(Ordering::Relaxed) == 0 { "DECODING" } else { "READING THE MUSIC" };
+                    bar(y, label, p);
+                    y += 36.0 * u;
+                } else if lan.is_loaded() {
+                    text_left("song ready on this PC", x, y, 22.0 * u, pal.accent);
+                    y += 36.0 * u;
+                }
+                if lan.host && lan.connected {
+                    let s = if !lan.my_ready {
+                        "press ENTER when ready: the song is sent to the other player"
+                    } else if lan.peer_loaded {
+                        "their copy is ready"
+                    } else {
+                        "their PC is getting the song ready..."
+                    };
+                    text_left(s, x, y, 22.0 * u, soft);
+                }
+                text_left("LEFT / RIGHT  character      ENTER  ready      ESC  leave", x, sh - 90.0 * u, 24.0 * u, pal.accent);
+                // input
+                if !lan.my_ready {
+                    let d = is_key_pressed(KeyCode::Right) as i32 - is_key_pressed(KeyCode::Left) as i32;
+                    if d != 0 {
+                        lan.my_char = (lan.my_char as i32 + d).rem_euclid(Character::ALL.len() as i32) as u8;
+                        self.audio.sfx(Sfx::UiMove, 0.6, 0.0);
+                        lan.send_lobby();
+                    }
+                    if lan.host {
+                        let td = is_key_pressed(KeyCode::E) as i32 - is_key_pressed(KeyCode::Q) as i32;
+                        if td != 0 {
+                            self.juke_next(td);
+                            let p = self.juke.list.get(self.juke.idx).cloned();
+                            lan.set_song(p);
+                        }
+                        if is_key_pressed(KeyCode::O) && lan.dialog.is_none() {
+                            let (tx, rx) = channel();
+                            std::thread::spawn(move || {
+                                let exts: Vec<&str> = decode::AUDIO_EXTS.to_vec();
+                                let r = rfd::FileDialog::new().set_title("Heartline - choose the Rally song").add_filter("Audio", &exts).pick_file();
+                                let _ = tx.send(r.into_iter().collect());
+                            });
+                            lan.dialog = Some(rx);
+                        }
+                    }
+                }
+                let picked = lan.dialog.as_ref().and_then(|rx| match rx.try_recv() {
+                    Ok(p) => Some(p),
+                    Err(std::sync::mpsc::TryRecvError::Disconnected) => Some(Vec::new()),
+                    Err(_) => None,
+                });
+                if let Some(p) = picked {
+                    lan.dialog = None;
+                    if let Some(f) = p.into_iter().next() {
+                        lan.set_song(Some(f));
+                    }
+                }
+                if enter {
+                    if lan.host && lan.song.is_none() {
+                        self.say("pick a song first (Q / E or O)");
+                    } else {
+                        lan.my_ready = !lan.my_ready;
+                        self.audio.sfx(Sfx::UiSelect, 0.8, 0.0);
+                        lan.note(format!("ready={} char={}", lan.my_ready, lan.my_char));
+                        lan.send_lobby();
+                    }
+                }
+                if esc {
+                    leave = Some(None);
+                }
+            }
+            LanStage::Countdown | LanStage::Match => {
+                let mut confirm_leave = false;
+                if let Some(m) = &mut lan.m {
+                    let left = m.start_local - net::now();
+                    if left > 0.0 {
+                        let n = ["1", "2", "3"][(left.ceil() as usize).clamp(1, 3) - 1];
+                        render::vtext(n, sw * 0.5, sh * 0.45, 180.0 * u, WHITE, 0);
+                    } else if left > -0.6 {
+                        render::vtext("GO", sw * 0.5, sh * 0.45, 180.0 * u, pal.accent, 0);
+                    }
+                    if esc {
+                        m.confirm = !m.confirm;
+                    } else if m.confirm {
+                        dim(0.55);
+                        render::vtext("LEAVE MATCH?", sw * 0.5, sh * 0.4, 72.0 * u, WHITE, 0);
+                        text_center("there is no pause in LAN play", sw * 0.5, sh * 0.47, 26.0 * u, soft);
+                        text_center("ENTER  leave          ESC  keep playing", sw * 0.5, sh * 0.54, 28.0 * u, pal.accent);
+                        confirm_leave = enter;
+                    }
+                }
+                if confirm_leave {
+                    leave = Some(None);
+                }
+            }
+            LanStage::Results => {
+                dim(0.6);
+                let me = if lan.host { 0 } else { 1 };
+                let (a, b) = (lan.result[me], lan.result[1 - me]);
+                let (head, col) = if a > b {
+                    ("YOU WIN", pal.accent)
+                } else if a < b {
+                    ("YOU LOSE", pal.danger)
+                } else {
+                    ("DRAW", WHITE)
+                };
+                render::vtext(head, sw * 0.5, sh * 0.3, 84.0 * u, col, 0);
+                text_center(&format!("{a}   :   {b}"), sw * 0.5, sh * 0.44, 96.0 * u, WHITE);
+                text_center(&format!("you vs {}", lan.peer), sw * 0.5, sh * 0.52, 28.0 * u, soft);
+                text_center("ENTER  back to the lobby          ESC  leave", sw * 0.5, sh * 0.7, 28.0 * u, pal.accent);
+                if enter {
+                    lan_to_lobby(&mut lan, false);
+                } else if esc {
+                    leave = Some(None);
+                }
+            }
+        }
+        self.lan = Some(lan);
+        if let Some(why) = leave {
+            self.lan_leave(why);
+        }
+    }
+}
+
+fn lan_to_lobby(lan: &mut Lan, ready: bool) {
+    lan.stage = LanStage::Lobby;
+    lan.my_ready = ready;
+    lan.note("back to lobby".into());
+    lan.send_lobby();
+}
+
+// ---------------------------------------------------------------------------------------------
 // Simple immediate-mode UI
 // ---------------------------------------------------------------------------------------------
 
@@ -1139,6 +2195,7 @@ async fn run(args: Args) {
         juke: Jukebox { list: Vec::new(), idx: 0, loaded: None, loader: None, cursor: 0, last_t: -1.0, playing: false, fails: 0 },
         autofire: true,
         fullscreen: false,
+        visuals: 0,
         menu_sel: 0,
         dialog: None,
         dialog_library: false,
@@ -1155,6 +2212,7 @@ async fn run(args: Args) {
         max_bullets: 0,
         max_enemies: 0,
         log: Vec::new(),
+        lan: None,
         args: args.clone(),
     };
     // ---- settings ----
@@ -1167,6 +2225,12 @@ async fn run(args: Args) {
     app.sfx_volume = getf("sfx", 0.5).clamp(0.0, 1.0);
     app.offset_ms = getf("offset_ms", 0.0).clamp(-100.0, 300.0);
     app.autofire = getf("autofire", 1.0) > 0.5;
+    app.visuals = (getf("visuals", 0.0).max(0.0) as usize).min(VISUALS.len() - 1);
+    // Borderless fullscreen is remembered between launches (never for bot or sized test runs).
+    if args.selftest.is_none() && args.size.is_none() && getf("fullscreen", 0.0) > 0.5 {
+        app.fullscreen = true;
+        display::set_borderless(true);
+    }
     app.music_dir = cfg.get("music_dir").map(PathBuf::from).filter(|p| p.is_dir()).or_else(|| music_folder().filter(|p| p.is_dir()));
     app.world = World::new(app.diff(), app.diff == 0);
     app.juke_rescan();
@@ -1200,6 +2264,8 @@ async fn run(args: Args) {
             }
         }
         app.start_live();
+    } else if args.lan_host.is_some() || args.lan_join.is_some() {
+        app.lan_cli();
     } else if !args.files.is_empty() {
         app.start_run(args.files.clone());
     }
@@ -1214,7 +2280,8 @@ async fn run(args: Args) {
         // ---- global keys ----
         if is_key_pressed(KeyCode::F11) {
             app.fullscreen = !app.fullscreen;
-            set_fullscreen(app.fullscreen);
+            display::set_borderless(app.fullscreen);
+            app.save_settings();
         }
         if is_key_pressed(KeyCode::F) && app.screen == Screen::Play {
             app.autofire = !app.autofire;
@@ -1252,6 +2319,10 @@ async fn run(args: Args) {
         }
 
         app.poll_loader();
+        if app.screen == Screen::Lan {
+            app.lan_poll(dt);
+        }
+        let lan_match = app.screen == Screen::Lan && app.lan.as_ref().is_some_and(|l| l.in_match());
         app.rend.update_view(&app.world);
 
         // ---- simulate ----
@@ -1260,6 +2331,10 @@ async fn run(args: Args) {
         let mut idle_target = 1.0;
         let mut progress = 0.0;
         match app.screen {
+            Screen::Lan if lan_match => {
+                idle_target = 0.0;
+                progress = app.lan_step(dt);
+            }
             Screen::Play => {
                 let mut input = if bot { tools::bot_input(&app.world) } else { app.gather_input(true) };
                 if bot && app.args.mortal {
@@ -1320,8 +2395,14 @@ async fn run(args: Args) {
 
         // ---- draw ----
         app.rend.set_palette(app.world.palette);
-        app.rend.draw_scene(&app.world, dt, app.idle, progress);
-        app.rend.draw_hud(&app.world, &hud, app.idle);
+        if lan_match && app.lan.as_ref().is_some_and(|l| l.in_match()) {
+            // Rally draws its own field and score HUD over the music-reactive scene.
+            app.lan_draw(dt);
+        } else {
+            app.feed_signal();
+            app.rend.draw_scene(&app.world, dt, app.idle, progress);
+            app.rend.draw_hud(&app.world, &hud, app.idle);
+        }
         let pal = app.rend.pal;
         let (sw, sh) = (screen_width(), screen_height());
         let u = sh / 1080.0;
@@ -1344,14 +2425,16 @@ async fn run(args: Args) {
                     "PLAY FOLDER...".to_string(),
                     format!("MUSIC LIBRARY   {lib_name}  ({n_lib} tracks)"),
                     "LIVE AUDIO   (what your PC is playing)".to_string(),
+                    "LAN RALLY   (two PCs, same network)".to_string(),
                     format!("DIFFICULTY   {}", DIFFS[app.diff].1),
                     format!("MUSIC VOLUME   {:.0}%", app.volume * 100.0),
                     format!("EFFECTS VOLUME   {:.0}%", app.sfx_volume * 100.0),
                     format!("SYNC OFFSET   {:+.0} ms", app.offset_ms),
-                    format!("FULLSCREEN   {}", if app.fullscreen { "ON" } else { "OFF" }),
+                    format!("VISUALS   {}", VISUALS[app.visuals].1),
+                    format!("DISPLAY   {}", if app.fullscreen { "BORDERLESS FULLSCREEN" } else { "WINDOWED" }),
                     "QUIT".to_string(),
                 ];
-                let act = if app.dialog.is_none() { menu_list(&items, &mut app.menu_sel, 110.0 * u, 280.0 * u, u, &app.rend, &app.audio) } else { None };
+                let act = if app.dialog.is_none() { menu_list(&items, &mut app.menu_sel, 110.0 * u, 256.0 * u, u, &app.rend, &app.audio) } else { None };
                 // left/right adjusts the selected row; on the play rows it changes the track
                 let dirk = is_key_pressed(KeyCode::Right) as i32 - is_key_pressed(KeyCode::Left) as i32;
                 let track_dirk = is_key_pressed(KeyCode::E) as i32 - is_key_pressed(KeyCode::Q) as i32 + if app.menu_sel <= 1 { dirk } else { 0 };
@@ -1362,10 +2445,11 @@ async fn run(args: Args) {
                 if dirk != 0 {
                     changed = true;
                     match app.menu_sel {
-                        6 => app.diff = ((app.diff as i32 + dirk).rem_euclid(3)) as usize,
-                        7 => app.volume = (app.volume + 0.1 * dirk as f32).clamp(0.0, 1.0),
-                        8 => app.sfx_volume = (app.sfx_volume + 0.1 * dirk as f32).clamp(0.0, 1.0),
-                        9 => app.offset_ms = (app.offset_ms + 10.0 * dirk as f32).clamp(-100.0, 300.0),
+                        7 => app.diff = ((app.diff as i32 + dirk).rem_euclid(3)) as usize,
+                        8 => app.volume = (app.volume + 0.1 * dirk as f32).clamp(0.0, 1.0),
+                        9 => app.sfx_volume = (app.sfx_volume + 0.1 * dirk as f32).clamp(0.0, 1.0),
+                        10 => app.offset_ms = (app.offset_ms + 10.0 * dirk as f32).clamp(-100.0, 300.0),
+                        11 => app.visuals = ((app.visuals as i32 + dirk).rem_euclid(VISUALS.len() as i32)) as usize,
                         _ => changed = false,
                     }
                 }
@@ -1401,34 +2485,40 @@ async fn run(args: Args) {
                         app.screen = Screen::LiveSetup;
                         app.menu_sel = 0;
                     }
-                    Some(6) => {
+                    Some(6) => app.lan_open(),
+                    Some(7) => {
                         app.diff = (app.diff + 1) % 3;
                         changed = true;
                     }
-                    Some(7) => {
+                    Some(8) => {
                         app.volume = if app.volume >= 0.99 { 0.0 } else { (app.volume + 0.1).min(1.0) };
                         changed = true;
                     }
-                    Some(8) => {
+                    Some(9) => {
                         app.sfx_volume = if app.sfx_volume >= 0.99 { 0.0 } else { (app.sfx_volume + 0.1).min(1.0) };
                         changed = true;
                     }
-                    Some(9) => {
+                    Some(10) => {
                         app.offset_ms = if app.offset_ms >= 295.0 { -100.0 } else { app.offset_ms + 10.0 };
                         changed = true;
                     }
-                    Some(10) => {
-                        app.fullscreen = !app.fullscreen;
-                        set_fullscreen(app.fullscreen);
+                    Some(11) => {
+                        app.visuals = (app.visuals + 1) % VISUALS.len();
+                        changed = true;
                     }
-                    Some(11) => break,
+                    Some(12) => {
+                        app.fullscreen = !app.fullscreen;
+                        display::set_borderless(app.fullscreen);
+                        changed = true;
+                    }
+                    Some(13) => break,
                     _ => {}
                 }
                 if changed {
                     let mute = app.args.mute;
                     app.audio.set_volume(if mute { 0.0 } else { app.volume });
                     app.audio.set_sfx_volume(if mute { 0.0 } else { app.sfx_volume });
-                    if app.menu_sel == 8 {
+                    if app.menu_sel == 9 {
                         app.audio.sfx(Sfx::Shard, 1.0, 0.0);
                     }
                     app.save_settings();
@@ -1443,7 +2533,9 @@ async fn run(args: Args) {
                 app.rend.draw_now_playing(sw - 700.0 * u, 110.0 * u, 590.0 * u, u, &app.world, &title, &hint, progress);
                 let hy = sh - 60.0 * u;
                 let help = match app.menu_sel {
-                    9 => "SYNC OFFSET: raise it if attacks land before you hear the beat (soundbar / Bluetooth lag), lower it if they land late",
+                    11 => "VISUALS: how hard the scene pulses with the music (zoom punches, flashes, rings). SUBTLE or OFF for comfort",
+                    6 => "LAN RALLY: a beat-locked paddle duel against a second PC on your network; the host picks the song",
+                    10 => "SYNC OFFSET: raise it if attacks land before you hear the beat (soundbar / Bluetooth lag), lower it if they land late",
                     4 => "MUSIC LIBRARY: the folder the menu plays from and SHUFFLE RUN draws its tracks from",
                     1 => "SHUFFLE RUN: this track plus four more; HP, upgrades and score carry over and the Heart gets tougher",
                     _ => "drop audio files or folders on the window to play them",
@@ -1605,6 +2697,7 @@ async fn run(args: Args) {
                     app.start_run(q);
                 }
             }
+            Screen::Lan => app.lan_ui(u, sw, sh),
             Screen::Play => {}
         }
 
@@ -1643,8 +2736,14 @@ async fn run(args: Args) {
                 ));
                 app.shots_done += 1;
             }
-            let over = app.wall >= app.args.secs || app.screen == Screen::Results && app.wall > 3.0 && app.shots_done >= app.args.shots.len();
+            // A LAN client waits (a little) for the host's End so both logs hold the final score.
+            let lan_wait = app.lan.as_ref().is_some_and(|l| !l.host && l.in_match()) && app.wall < app.args.secs + 10.0;
+            let over = (app.wall >= app.args.secs && !lan_wait) || app.screen == Screen::Results && app.wall > 3.0 && app.shots_done >= app.args.shots.len();
             if over {
+                if let Some(lan) = app.lan.as_mut() {
+                    let stage = lan.stage;
+                    lan.note(format!("selftest end stage={stage:?} result={}-{}", lan.result[0], lan.result[1]));
+                }
                 app.log.push(format!(
                     "done wall={:.1}s frames={} avg_fps={:.1} max_bullets={} max_enemies={} score={} kills={} hits={} screen={} status='{}'",
                     app.wall,
