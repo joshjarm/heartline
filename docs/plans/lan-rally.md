@@ -117,7 +117,11 @@ Duet co-op, Heart vs Runner, Crossfire, best-of-N song matches, a spectator view
     flags `--lan-host` / `--lan-join` / `--rally-bot`
 - **Tests:** 27 pass and 1 is ignored (the real-TCP test), including in-memory session tests for
   sync, the song transfer and snapshots.
-- **Not verified yet:** a real two-instance match, and Rally on screen. Every loopback TCP connect
+- **Verified (later the same day):** a two-instance bot match over 127.0.0.1 ended 6-4 on both
+  sides. Points matched within 4 ms, audio started 3.95 ms late on both, RTT was 0.11 ms, 2260
+  snapshots arrived with 0 bad, and traffic was about 15 KB/s. The connect failures stopped after
+  the user turned off Windows Firewall, so a firewall allow rule for heartline.exe is needed.
+- **Earlier note:** every loopback TCP connect
   fails with WSAEACCES when started from inside the desktop coding app (even its terminal panel).
   The host listens fine (`0.0.0.0:47820`).
   - Test from a normal PowerShell window outside that app:
