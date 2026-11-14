@@ -2,6 +2,21 @@
 
 _A top-down vaporwave bullet-hell where the level **is** the song._
 
+## 0. Revisions in 0.2 (after the first playtest, 2026-11-14)
+
+These override the sections below where they differ:
+- **Not a bullet hell.** Fewer, faster bullets; attacks are *directed* (cones, walls with a
+  gap, pincers, crosses laid out around the player) and *announced* on the floor before they
+  fire on the beat, so there is always obvious empty space to move into.
+- **The song decides when and in what shape, never how hard.** All budgets are per second;
+  tempo only picks the moments. Each song ramps up from a gentle start and backs off after a hit.
+- **Bars have a shape:** one attack motif per section kind, reused when that kind returns.
+- **Tile strikes are phrases** (sweeps, ripples, flips) that wind up for a bar and slam on beats.
+- **Look:** neon line art with depth (2.5D), calm floor, music visualised as ridgelines at the
+  arena rim and around the Heart; drift mode is the same world relaxing, not an overlay.
+- **Sound:** the menu plays the library or built-in synthesised tracks and cross-fades into the
+  level; a small bank of soft synthesised sound effects sits under the music.
+
 ## 1. Pitch
 
 Drop in MP3s (or point the game at whatever your PC is playing). Heartline breaks the audio
