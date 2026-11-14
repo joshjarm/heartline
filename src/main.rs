@@ -71,6 +71,8 @@ pub struct Args {
     lan_join: Option<String>,
     /// LAN test: the local Rally player is the bot (auto character, auto ready).
     rally_bot: bool,
+    /// Offline Rally practice with this song: you (or `--rally-bot`) vs the bot, no network.
+    rally_local: Option<PathBuf>,
 }
 
 fn parse_args() -> Args {
@@ -119,6 +121,7 @@ fn parse_args() -> Args {
             "--lan-host" => a.lan_host = Some(PathBuf::from(val())),
             "--lan-join" => a.lan_join = Some(val()),
             "--rally-bot" => a.rally_bot = true,
+            "--rally-local" => a.rally_local = Some(PathBuf::from(val())),
             "--size" => {
                 let v = val();
                 let mut p = v.split('x');
@@ -1226,11 +1229,14 @@ struct Lan {
     result_t: f32,
     log_path: Option<PathBuf>,
     log: Vec<String>,
+    /// Offline practice (`--rally-local`): no network, the peer is the bot.
+    local: bool,
 }
 
 impl Lan {
     fn new(log_dir: Option<&Path>) -> Lan {
         Lan {
+            local: false,
             host: false,
             stage: LanStage::Choose,
             net: None,
@@ -1361,7 +1367,13 @@ impl App {
     fn lan_cli(&mut self) {
         self.lan_open();
         let Some(mut lan) = self.lan.take() else { return };
-        if let Some(f) = self.args.lan_host.clone() {
+        if let Some(f) = self.args.rally_local.clone() {
+            lan.host = true;
+            lan.local = true;
+            lan.stage = LanStage::Lobby;
+            lan.set_song(Some(f));
+            lan.note("local practice vs bot".into());
+        } else if let Some(f) = self.args.lan_host.clone() {
             self.lan_start_host(&mut lan, Some(f));
         } else if let Some(ip) = self.args.lan_join.clone() {
             match net::parse_addr(&ip) {
@@ -1484,6 +1496,11 @@ impl App {
                     lan.xfer = (0, 0);
                     lan.note(format!("sending song '{}'", lan.song_title));
                 }
+            }
+            if lan.local && lan.stage == LanStage::Lobby && lan.is_loaded() {
+                let seed = if self.args.seed != 0 { self.args.seed } else { 1 };
+                let chars = [lan.my_char, 2];
+                self.lan_begin(&mut lan, net::now() + LAN_COUNTDOWN, seed, chars);
             }
             let go = lan.stage == LanStage::Lobby
                 && lan.connected
@@ -1716,6 +1733,9 @@ impl App {
                     let mut pin = m.peer_in;
                     pin.swing = m.peer_pulse;
                     m.peer_pulse = false;
+                    if lan.local {
+                        pin = m.rally.bot_input(1, t, &music);
+                    }
                     m.rally.step(dt, t, [inp, pin], &music);
                 }
                 m.send_acc += dt;
@@ -2264,7 +2284,7 @@ async fn run(args: Args) {
             }
         }
         app.start_live();
-    } else if args.lan_host.is_some() || args.lan_join.is_some() {
+    } else if args.lan_host.is_some() || args.lan_join.is_some() || args.rally_local.is_some() {
         app.lan_cli();
     } else if !args.files.is_empty() {
         app.start_run(args.files.clone());

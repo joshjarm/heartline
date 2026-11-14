@@ -30,9 +30,12 @@ pub const SWING_ACTIVE: f32 = 0.12; // s, the arc is live this long after the pr
 pub const SWING_CD: f32 = 0.30; // s, from press to the next allowed swing
 pub const SWING_R: f32 = 86.0; // px, arc reach from the avatar centre
 pub const SWING_HALF: f32 = 1.2; // rad, arc half-angle around the aim (~69 deg)
-pub const PERFECT_WIN: f32 = 0.070; // s, |press - nearest beat| for a perfect return
+pub const PERFECT_WIN: f32 = 0.100; // s, |contact - strike beat| for a perfect return
 const RET_MAX_ANGLE: f32 = 1.05; // rad, returns are clamped to +-60 deg off straight ahead
 // ---- beat-locked flight ----
+pub const STRIKE_IN: f32 = 125.0; // px, strike line in front of each end line: orbs cross it on a beat
+/// `Fx::err` when the event has no timing judgement.
+pub const NO_ERR: i16 = i16::MIN;
 const MIN_FLIGHT_CALM: f32 = 3.0; // beats
 const MIN_FLIGHT_NORMAL: f32 = 2.0;
 const MIN_FLIGHT_INTENSE: f32 = 1.5;
@@ -60,17 +63,17 @@ pub const MAX_FX: usize = 8;
 const NEVER: f32 = -1.0e6;
 // ---- bot ----
 const BOT_REACT: f32 = 0.14; // s before the bot reacts to a new return
-const BOT_INT_X: f32 = 0.55; // intercept line, as a fraction of the zone width from the end line
-const BOT_HOME_X: f32 = 0.45; // idle position, same units
-const BOT_STANDOFF: f32 = 36.0; // px the bot stands behind the intercept point
+const BOT_HOME_X: f32 = 0.45; // idle position, as a fraction of the zone width from the end line
+const BOT_STANDOFF: f32 = 40.0; // px the bot stands behind the strike line
 const BOT_GAIN: f32 = 0.10; // s, movement look-ahead (smaller = snappier)
 const BOT_MISS: f32 = 0.22; // chance per incoming orb that the bot misjudges it
 const BOT_MISS_OFF: f32 = 150.0; // px lateral error on a misjudged orb
-const BOT_LEAD: f32 = 0.06; // s, swing this long before closest approach
+const BOT_EARLY: f32 = 0.09; // s, the bot presses up to this early...
+const BOT_LATE: f32 = 0.06; // s, ...or this late around the strike beat (late ones can whiff)
 const BOT_AIM_GOAL: f32 = 0.7; // aims at this fraction of the goal half-height
 const BOT_SERVE_WAIT: f32 = 0.3; // s before auto-serve at which the bot stops waiting for a beat
 
-const SNAP_VER: u8 = 0xA1;
+const SNAP_VER: u8 = 0xA2;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Character {
@@ -146,8 +149,10 @@ pub struct Orb {
     pub power: Power,
     pub p0: Vec2,
     pub t0: f32,
-    /// Arrival time at the end line (a beat), or the auto-serve time while held.
+    /// Arrival time at the end line (just after `tb`), or the auto-serve time while held.
     pub t1: f32,
+    /// The beat on which the orb crosses the defender's strike line.
+    pub tb: f32,
     pub xe: f32,
     /// Unfolded aim-line y at the end line.
     pub y1: f32,
@@ -168,6 +173,7 @@ impl Orb {
         p0: Vec2::ZERO,
         t0: 0.0,
         t1: 0.0,
+        tb: 0.0,
         xe: 0.0,
         y1: 0.0,
         curve: 0.0,
@@ -186,8 +192,9 @@ impl Orb {
         let mut y = self.p0.y + (self.y1 - self.p0.y) * s;
         match self.power {
             Power::Tick => {
-                let f = ((self.t1 - t) / self.blen.max(0.05)).rem_euclid(1.0);
-                y += ZIG_AMP * tri(f) * (s * ZIG_RAMP).min(1.0);
+                // zero on every beat (so at the strike line) and faded out by the end line
+                let f = ((self.tb - t) / self.blen.max(0.05)).rem_euclid(1.0);
+                y += ZIG_AMP * tri(f) * (s * ZIG_RAMP).min(1.0) * ((1.0 - s) * ZIG_RAMP).min(1.0);
             }
             Power::Arc => y += CURVE_AMP * self.curve * (PI * s).sin(),
             _ => {}
@@ -195,9 +202,23 @@ impl Orb {
         vec2(x, fold(y))
     }
 
-    /// 0 at launch .. 1 on the arrival beat.
+    /// 0 at launch .. 1 at the end line.
     pub fn progress(&self, t: f32) -> f32 {
         ((t - self.t0) / (self.t1 - self.t0).max(1e-3)).clamp(0.0, 1.0)
+    }
+
+    /// Song time at which the orb is at x (its x is linear in time).
+    pub fn time_at_x(&self, x: f32) -> f32 {
+        let span = self.xe - self.p0.x;
+        if span.abs() < 1e-3 {
+            return self.t1;
+        }
+        self.t0 + (x - self.p0.x) / span * (self.t1 - self.t0)
+    }
+
+    /// Where the orb crosses the defender's strike line (on beat `tb`).
+    pub fn strike_point(&self) -> Vec2 {
+        self.eval(self.tb)
     }
 
     /// The player this orb is heading for.
@@ -245,6 +266,8 @@ pub struct Fx {
     pub who: u8,
     pub pos: Vec2,
     pub t: f32,
+    /// Contact timing for Hit / Perfect: ms vs the strike beat (negative = early), or `NO_ERR`.
+    pub err: i16,
 }
 
 #[derive(Clone, Debug)]
@@ -281,6 +304,11 @@ pub fn fwd(i: usize) -> f32 {
 /// x of player `i`'s own end line (the goal they defend).
 pub fn end_x(i: usize) -> f32 {
     -fwd(i) * HALF_W
+}
+
+/// x of player `i`'s strike line: incoming orbs cross it exactly on a beat.
+pub fn strike_x(i: usize) -> f32 {
+    end_x(i) + fwd(i) * STRIKE_IN
 }
 
 fn zone_clamp(i: usize, p: Vec2) -> Vec2 {
@@ -372,6 +400,25 @@ pub fn beat_dist(beats: &[f32], t: f32) -> f32 {
     (grid_time(beats, i, DEFAULT_BEAT) - t).abs().min((t - grid_time(beats, i - 1, DEFAULT_BEAT)).abs())
 }
 
+/// Signed offset in seconds from the nearest beat to `t` (negative = before the beat).
+pub fn beat_off(beats: &[f32], t: f32) -> f32 {
+    let i = grid_after(beats, t, DEFAULT_BEAT);
+    let (a, b) = (t - grid_time(beats, i, DEFAULT_BEAT), t - grid_time(beats, i - 1, DEFAULT_BEAT));
+    if a.abs() < b.abs() {
+        a
+    } else {
+        b
+    }
+}
+
+fn err_ms(e: f32) -> i16 {
+    if e.is_finite() {
+        (e * 1000.0).round().clamp(-30000.0, 30000.0) as i16
+    } else {
+        NO_ERR
+    }
+}
+
 fn beat_len_at(beats: &[f32], t: f32) -> f32 {
     let i = grid_after(beats, t, DEFAULT_BEAT);
     let l = grid_time(beats, i, DEFAULT_BEAT) - grid_time(beats, i - 1, DEFAULT_BEAT);
@@ -391,8 +438,8 @@ pub fn min_flight(k: SectionKind) -> f32 {
     }
 }
 
-/// Beat-locked arrival for a return at `t`: the first beat at or after `t + min_flight`
-/// (one beat sooner on a perfect, never under `MIN_FLIGHT_S`).
+/// Beat-locked arrival at the defender's strike line for a return at `t`: the first beat at or
+/// after `t + min_flight` (one beat sooner on a perfect, never under `MIN_FLIGHT_S`).
 pub fn arrival_time(m: &RallyMusic, t: f32, perfect: bool) -> f32 {
     let b = beat_len_at(m.beats, t);
     let earliest = t + MIN_FLIGHT_S;
@@ -440,7 +487,7 @@ impl Rally {
             t: 0.0,
             players: [player(0), player(1)],
             orbs: [Orb::DEAD; MAX_ORBS],
-            fx: [Fx { kind: FxKind::Hit, who: 0, pos: Vec2::ZERO, t: NEVER }; MAX_FX],
+            fx: [Fx { kind: FxKind::Hit, who: 0, pos: Vec2::ZERO, t: NEVER, err: NO_ERR }; MAX_FX],
             fx_head: 0,
             scores: [0; 2],
             goal_half: GOAL_HALF,
@@ -464,8 +511,12 @@ impl Rally {
     }
 
     fn push_fx(&mut self, kind: FxKind, who: usize, pos: Vec2) {
+        self.push_timed(kind, who, pos, NO_ERR);
+    }
+
+    fn push_timed(&mut self, kind: FxKind, who: usize, pos: Vec2, err: i16) {
         let i = self.fx_head as usize % MAX_FX;
-        self.fx[i] = Fx { kind, who: who as u8, pos, t: self.t };
+        self.fx[i] = Fx { kind, who: who as u8, pos, t: self.t, err };
         self.fx_head = ((i + 1) % MAX_FX) as u8;
     }
 
@@ -486,7 +537,7 @@ impl Rally {
         let nb = if m.next_build.is_finite() { m.next_build.clamp(0.0, 1.0) } else { 0.0 };
         self.goal_half = GOAL_HALF + (GOAL_HALF_BUILD - GOAL_HALF) * nb;
         for i in 0..2 {
-            self.step_player(i, dt, t, &inp[i], m);
+            self.step_player(i, dt, t, &inp[i]);
         }
         self.step_serve(t, m);
         for k in 0..MAX_ORBS {
@@ -496,7 +547,7 @@ impl Rally {
         }
     }
 
-    fn step_player(&mut self, i: usize, dt: f32, t: f32, inp: &RallyInput, m: &RallyMusic) {
+    fn step_player(&mut self, i: usize, dt: f32, t: f32, inp: &RallyInput) {
         let p = &mut self.players[i];
         if finite(inp.aim) && inp.aim.length_squared() > 1e-4 {
             p.aim = inp.aim.normalize();
@@ -508,7 +559,7 @@ impl Rally {
         if inp.swing && !p.prev && p.cd <= 0.0 {
             p.swing_t = t;
             p.cd = SWING_CD;
-            p.perfect = beat_dist(m.beats, t) <= PERFECT_WIN;
+            p.perfect = false; // judged at contact
         }
         p.prev = inp.swing;
     }
@@ -590,11 +641,12 @@ impl Rally {
             OrbState::Held => {
                 let s = o.owner as usize & 1;
                 if let Some(q) = self.swing_hit(s, o.pos, o.pos) {
-                    let (aim, perfect) = (self.players[s].aim, self.players[s].perfect);
-                    self.launch(&mut o, s, t, m, q, aim, perfect);
+                    // a serve has no incoming strike beat: judged against the nearest beat
+                    let aim = self.players[s].aim;
+                    self.launch(&mut o, s, t, m, q, aim, Some(beat_off(m.beats, t)));
                 } else if t >= o.t1 {
                     let from = o.pos;
-                    self.launch(&mut o, s, t, m, from, vec2(fwd(s), 0.0), false);
+                    self.launch(&mut o, s, t, m, from, vec2(fwd(s), 0.0), None);
                 }
             }
             OrbState::Flying => {
@@ -608,12 +660,14 @@ impl Rally {
                     self.knock(d, o.pos);
                 }
                 if let Some(q) = hit {
+                    // timing is judged at contact: when the orb is at q vs its strike beat
+                    let err = o.time_at_x(q.x) - o.tb;
                     if o.extra {
                         o.state = OrbState::Dead;
-                        self.push_fx(FxKind::Hit, d, q);
+                        self.push_timed(FxKind::Hit, d, q, err_ms(err));
                     } else {
-                        let (aim, perfect) = (self.players[d].aim, self.players[d].perfect);
-                        self.launch(&mut o, d, t, m, q, aim, perfect);
+                        let aim = self.players[d].aim;
+                        self.launch(&mut o, d, t, m, q, aim, Some(err));
                     }
                 } else if t >= o.t1 {
                     let at = vec2(o.xe, o.land);
@@ -630,7 +684,7 @@ impl Rally {
                         // off target: the end wall returns it for the defender (no power)
                         let v = o.eval(o.t1) - o.eval(o.t1 - 0.02);
                         let dir = vec2(fwd(d) * v.x.abs().max(1e-3), v.y);
-                        self.launch(&mut o, d, t, m, at, dir, false);
+                        self.launch(&mut o, d, t, m, at, dir, None);
                         // launch just pushed a Hit: show it as a bounce instead
                         let last = (self.fx_head as usize + MAX_FX - 1) % MAX_FX;
                         self.fx[last].kind = FxKind::Bounce;
@@ -641,33 +695,40 @@ impl Rally {
         self.orbs[k] = o;
     }
 
-    /// Return orb `o` from point `from` by player `h` toward `aim`, beat-locked.
+    /// Return orb `o` from point `from` by player `h` toward `aim`, beat-locked so it crosses the
+    /// defender's strike line on a beat. `timing` = contact error vs the beat in s (None = untimed).
     #[allow(clippy::too_many_arguments)]
-    fn launch(&mut self, o: &mut Orb, h: usize, t: f32, m: &RallyMusic, from: Vec2, aim: Vec2, perfect: bool) {
+    fn launch(&mut self, o: &mut Orb, h: usize, t: f32, m: &RallyMusic, from: Vec2, aim: Vec2, timing: Option<f32>) {
+        let perfect = timing.is_some_and(|e| e.abs() <= PERFECT_WIN);
+        self.players[h].perfect = perfect;
+        let err = timing.map_or(NO_ERR, err_ms);
         let f = fwd(h);
         let a = aim.y.atan2(aim.x * f);
         let a = if a.is_finite() { a.clamp(-RET_MAX_ANGLE, RET_MAX_ANGLE) } else { 0.0 };
         let d = vec2(f * a.cos(), a.sin());
         let xe = end_x(1 - h);
         let from = vec2(from.x.clamp(-HALF_W + 1.0, HALF_W - 1.0), fold(from.y));
-        let t1 = arrival_time(m, t, perfect);
+        let tb = arrival_time(m, t, perfect);
+        // constant x speed: strike line on `tb`, the end line a little after
+        let frac = ((strike_x(1 - h) - from.x) / (xe - from.x)).clamp(0.05, 1.0);
         o.state = OrbState::Flying;
         o.owner = h as u8;
         o.p0 = from;
         o.t0 = t;
-        o.t1 = t1;
+        o.tb = tb;
+        o.t1 = t + (tb - t) / frac;
         o.xe = xe;
         o.y1 = from.y + (xe - from.x) / d.x * d.y;
-        o.blen = beat_len_at(m.beats, t1 - 1e-3);
+        o.blen = beat_len_at(m.beats, tb - 1e-3);
         o.power = Power::None;
         o.curve = 0.0;
         o.land = fold(o.y1);
         o.pos = from;
         if !perfect {
-            self.push_fx(FxKind::Hit, h, from);
+            self.push_timed(FxKind::Hit, h, from, err);
             return;
         }
-        self.push_fx(FxKind::Perfect, h, from);
+        self.push_timed(FxKind::Perfect, h, from, err);
         match self.players[h].ch {
             Character::Sub => {
                 o.power = Power::Sub;
@@ -698,9 +759,9 @@ impl Rally {
     // Bot
     // -----------------------------------------------------------------------------------------
 
-    /// A decent opponent: tracks the predicted crossing of its intercept line, swings at closest
-    /// approach (on the beat when it can), aims away from the other player, and misjudges about
-    /// `BOT_MISS` of incoming orbs so games score.
+    /// A decent opponent: waits behind its strike line where the orb will cross, presses around
+    /// the strike beat (`BOT_EARLY`..`BOT_LATE`), aims away from the other player, and misjudges
+    /// about `BOT_MISS` of incoming orbs so games score.
     pub fn bot_input(&self, me: usize, t: f32, m: &RallyMusic) -> RallyInput {
         let me = me & 1;
         let p = &self.players[me];
@@ -732,27 +793,17 @@ impl Rally {
                 let close = o.pos.distance(p.pos) < SWING_R * 0.8;
                 want = close && (beat_dist(m.beats, t) < 0.02 || t > o.t1 - BOT_SERVE_WAIT);
             } else if t - o.t0 >= BOT_REACT {
-                let xi = end_x(me) + f * ZONE_W * BOT_INT_X;
-                let span = o.xe - o.p0.x;
-                let s = if span.abs() > 1.0 { ((xi - o.p0.x) / span).clamp(0.0, 1.0) } else { 1.0 };
-                let ti = o.t0 + s * (o.t1 - o.t0);
-                let pred = if ti > t { o.eval(ti) } else { o.eval(t + 0.03) };
-                let miss = h01(self.seed, ((o.id as u64) << 8) ^ (o.t1.to_bits() as u64) << 1 ^ me as u64);
+                // wait just behind the strike line where the orb will cross it, press around its beat
+                let pred = if o.tb > t { o.strike_point() } else { o.eval(t + 0.03) };
+                let key = ((o.id as u64) << 8) ^ (o.tb.to_bits() as u64) << 1 ^ me as u64;
+                let miss = h01(self.seed, key);
                 let err = if miss < BOT_MISS { if miss < BOT_MISS * 0.5 { BOT_MISS_OFF } else { -BOT_MISS_OFF } } else { 0.0 };
-                target = pred + vec2(-f * BOT_STANDOFF, err);
+                target = vec2(strike_x(me) - f * BOT_STANDOFF, pred.y + err);
                 // face between the incoming orb and the goal so the arc covers it
                 let to_orb = (o.pos - p.pos).normalize_or_zero();
                 aim = (aim + to_orb).normalize_or_zero();
-                let v = (o.eval(t + 0.01) - o.eval(t)) / 0.01;
-                let rel = o.pos - p.pos;
-                let v2 = v.length_squared();
-                if v2 > 1.0 {
-                    let tc = -rel.dot(v) / v2;
-                    let miss_d = (rel + v * tc).length();
-                    let reach = miss_d < SWING_R * 0.85;
-                    let on_beat = beat_dist(m.beats, t) < PERFECT_WIN * 0.4 && (-0.02..SWING_ACTIVE * 0.8).contains(&tc);
-                    want = reach && ((-0.02..BOT_LEAD).contains(&tc) || on_beat);
-                }
+                let jit = -BOT_EARLY + h01(self.seed, key ^ 0x5EED) * (BOT_EARLY + BOT_LATE);
+                want = t >= o.tb + jit && t < o.tb + BOT_LATE + SWING_ACTIVE;
             }
         }
         let mv = ((target - p.pos) / (PLAYER_SPEED * BOT_GAIN)).clamp_length_max(1.0);
@@ -790,7 +841,7 @@ impl Rally {
             out.push(o.state as u8);
             out.push(o.extra as u8 | (o.owner & 1) << 1);
             out.push(o.power as u8);
-            for v in [o.p0.x, o.p0.y, o.t0, o.t1, o.xe, o.y1, o.curve, o.blen, o.land, o.pos.x, o.pos.y] {
+            for v in [o.p0.x, o.p0.y, o.t0, o.t1, o.tb, o.xe, o.y1, o.curve, o.blen, o.land, o.pos.x, o.pos.y] {
                 f(out, v);
             }
         }
@@ -803,6 +854,7 @@ impl Rally {
             for v in [e.pos.x, e.pos.y, e.t] {
                 f(out, v);
             }
+            out.extend_from_slice(&e.err.to_le_bytes());
         }
     }
 
@@ -886,19 +938,20 @@ impl Rally {
                 3 => Power::Arc,
                 _ => return None,
             };
-            let mut v = [0.0f32; 11];
+            let mut v = [0.0f32; 12];
             for x in v.iter_mut() {
                 *x = rd.f32()?;
             }
             o.p0 = vec2(v[0], v[1]);
             o.t0 = v[2];
             o.t1 = v[3];
-            o.xe = v[4];
-            o.y1 = v[5];
-            o.curve = v[6];
-            o.blen = v[7];
-            o.land = v[8];
-            o.pos = vec2(v[9], v[10]);
+            o.tb = v[4];
+            o.xe = v[5];
+            o.y1 = v[6];
+            o.curve = v[7];
+            o.blen = v[8];
+            o.land = v[9];
+            o.pos = vec2(v[10], v[11]);
         }
         let n = rd.u8()? as usize;
         if n > MAX_FX {
@@ -916,6 +969,7 @@ impl Rally {
             e.who = who;
             e.pos = vec2(rd.f32()?, rd.f32()?);
             e.t = rd.f32()?;
+            e.err = i16::from_le_bytes(rd.take()?);
         }
         r.fx_head = (n % MAX_FX) as u8;
         if rd.i != b.len() {
@@ -1027,15 +1081,64 @@ mod tests {
                 t += dt;
                 r.step(dt, t, [RallyInput { mv: vec2(0.0, -1.0), ..Default::default() }; 2], &m);
                 let x = r.orbs.iter().find(|x| x.id == o.id).map(|x| x.pos.x);
-                if x.map_or(true, |x| x >= HALF_W - 2.0) {
+                if x.map_or(true, |x| x >= strike_x(1)) {
                     crossed = Some(t);
                     break;
                 }
             }
-            let tc = crossed.expect("orb reached the end line");
+            let tc = crossed.expect("orb reached the strike line");
             assert!(beat_dist(&beats, tc) <= 0.005, "{sec:?}: crossed at {tc}, {} from a beat", beat_dist(&beats, tc));
-            assert!(o.t1 - o.t0 >= min_flight(sec) * BPM_BEAT - 0.03);
+            assert!(o.tb - o.t0 >= min_flight(sec) * BPM_BEAT - 0.03);
+            assert!(o.t1 > o.tb, "the end line comes after the strike line");
         }
+    }
+
+    /// Serves an off-beat straight orb from player 0 to player 1; returns (rally, t, orb).
+    fn incoming(m: &RallyMusic, dt: f32) -> (Rally, f32, Orb) {
+        let mut r = Rally::new(21, [Character::Crack, Character::Tick]);
+        r.last_conceder = 0;
+        let mut t = until_held(&mut r, m, 0.0, dt) + 0.2;
+        swing(&mut r, m, 0, t, dt, vec2(1.0, 0.0));
+        let o = *r.orbs.iter().find(|o| o.state == OrbState::Flying).expect("launched");
+        t += dt;
+        (r, t, o)
+    }
+
+    /// Player 1 stands at `pos` facing the orb, presses at `press`; returns the contact Fx.
+    fn contact(m: &RallyMusic, pos_of: impl Fn(&Orb) -> Vec2, press_before_tb: f32) -> Fx {
+        let dt = 1.0 / 240.0;
+        let (mut r, mut t, o) = incoming(m, dt);
+        r.players[1].pos = pos_of(&o);
+        let mut pressed = false;
+        while t < o.t1 + 0.2 {
+            let mut inp = [RallyInput::default(); 2];
+            inp[1].aim = vec2(-1.0, 0.0);
+            if !pressed && t >= o.tb - press_before_tb {
+                inp[1].swing = true;
+                pressed = true;
+            }
+            r.step(dt, t, inp, m);
+            if let Some(e) = r.events().find(|e| e.who == 1 && matches!(e.kind, FxKind::Hit | FxKind::Perfect)) {
+                return *e;
+            }
+            t += dt;
+        }
+        panic!("no contact");
+    }
+
+    #[test]
+    fn perfect_is_judged_at_the_strike_line() {
+        let beats = grid(BPM_BEAT, 200, false);
+        let bars = grid(BPM_BEAT * 4.0, 50, false);
+        let m = music(&beats, &bars, SectionKind::Normal);
+        // on the line: just behind the strike point, pressing as the orb arrives
+        let e = contact(&m, |o| o.strike_point() + vec2(40.0, 0.0), 0.02);
+        assert_eq!(e.kind, FxKind::Perfect, "err {}ms", e.err);
+        assert!((e.err as f32).abs() <= PERFECT_WIN * 1000.0);
+        // 150 ms early: standing where the orb is 150 ms before the beat
+        let e = contact(&m, |o| o.eval(o.tb - 0.15) + vec2(30.0, 0.0), 0.17);
+        assert_eq!(e.kind, FxKind::Hit, "err {}ms", e.err);
+        assert!(e.err < -(PERFECT_WIN * 1000.0) as i16, "early err {}ms", e.err);
     }
 
     #[test]
@@ -1066,7 +1169,7 @@ mod tests {
         swing(&mut r, &m, 0, beats[k], beats[k] - tt, vec2(1.0, 0.0));
         assert!(r.players[0].perfect);
         let o = r.orbs.iter().find(|o| o.state == OrbState::Flying && !o.extra).expect("launched");
-        assert!((o.t1 - beats[k + 1]).abs() < 1e-4, "perfect t1 {} vs {}", o.t1, beats[k + 1]);
+        assert!((o.tb - beats[k + 1]).abs() < 1e-4, "perfect tb {} vs {}", o.tb, beats[k + 1]);
         assert_eq!(r.orbs.iter().filter(|o| o.extra).count(), 1, "crack splits");
     }
 

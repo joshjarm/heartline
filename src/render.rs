@@ -2809,6 +2809,41 @@ impl Renderer {
             line(lp + inward * sz, lp + inward * (sz + 40.0 * k), 2.0, alpha(col, 0.5 * k));
         }
 
+        // ---- strike lines: pulse on every beat; incoming orbs cross them exactly on a beat ----
+        let bp = w.beat_pulse.clamp(0.0, 1.0);
+        gl_use_material(&self.add_mat);
+        for (i, &col) in cols.iter().enumerate() {
+            let x = rally::strike_x(i);
+            let g = r.goal_half;
+            let lc = mixc(col, WHITE, 0.35 * bp);
+            line(vec2(x, -HALF_H), vec2(x, -g), 1.2, alpha(lc, 0.18 + 0.2 * bp));
+            line(vec2(x, g), vec2(x, HALF_H), 1.2, alpha(lc, 0.18 + 0.2 * bp));
+            line(vec2(x, -g), vec2(x, g), RALLY_STRIKE_W * (1.0 + bp), alpha(lc, 0.10 * (1.0 + bp)));
+            line(vec2(x, -g), vec2(x, g), 2.0 + 1.5 * bp, alpha(lc, 0.45 + 0.45 * bp));
+        }
+        gl_use_default_material();
+
+        // ---- approach rings: close on the strike point exactly on the strike beat ----
+        for o in r.orbs.iter().filter(|o| o.state == OrbState::Flying && !(o.extra && o.target() != me)) {
+            let lead = RALLY_RING_BEATS * o.blen.max(0.1);
+            let dtb = o.tb - t;
+            if dtb > lead || dtb < -RALLY_RING_HOLD {
+                continue;
+            }
+            let mine = o.target() == me;
+            let sp = o.strike_point();
+            let col = mixc(cols[o.target()], WHITE, if mine { 0.5 } else { 0.1 });
+            let base = if mine { 1.0 } else { 0.45 };
+            if dtb >= 0.0 {
+                let k = dtb / lead; // 1 -> 0 as the beat arrives
+                arc(sp, ORB_R + 6.0, 0.0, TAU, 2.0, alpha(col, base * 0.7));
+                arc(sp, ORB_R + 6.0 + RALLY_RING_R * k, 0.0, TAU, if mine { 3.0 } else { 1.6 }, alpha(col, base * (1.0 - 0.6 * k)));
+            } else {
+                let k = -dtb / RALLY_RING_HOLD;
+                disc2(sp, ORB_R + 18.0, 18, alpha(WHITE, base * 0.5 * (1.0 - k)), alpha(col, 0.0));
+            }
+        }
+
         // ---- avatars: reach ghost, live swing arc, mini spectrum, body ----
         for (i, p) in r.players.iter().enumerate() {
             let c = cols[i];
@@ -2836,6 +2871,7 @@ impl Renderer {
             disc2(p.pos, rr * 2.4, 18, alpha(c, 0.3), alpha(c, 0.0));
             disc(p.pos, rr, 18, c);
             disc(p.pos, rr * 0.42, 10, alpha(WHITE, 0.95));
+            arc(p.pos, rr + 13.0 + 8.0 * (1.0 - bp), 0.0, TAU, 1.5, alpha(c, 0.45 * bp));
             if p.cd > 0.0 {
                 let frac = 1.0 - (p.cd / rally::SWING_CD).clamp(0.0, 1.0);
                 arc(p.pos, rr + 5.0, -PI * 0.5, -PI * 0.5 + TAU * frac, 1.5, alpha(WHITE, 0.5));
@@ -2933,9 +2969,18 @@ impl Renderer {
         gl_use_default_material();
         for e in r.events() {
             let age = t - e.t;
-            if e.kind == FxKind::Perfect && (0.0..RALLY_FLASH_LIFE * 2.0).contains(&age) {
-                let k = 1.0 - age / (RALLY_FLASH_LIFE * 2.0);
-                wtext("PERFECT", e.pos - vec2(0.0, 44.0 + 30.0 * (1.0 - k)), 22.0, alpha(WHITE, k), tscale);
+            let timed = matches!(e.kind, FxKind::Perfect | FxKind::Hit) && e.err != rally::NO_ERR;
+            if timed && (0.0..RALLY_TEXT_LIFE).contains(&age) {
+                let k = 1.0 - age / RALLY_TEXT_LIFE;
+                let pos = e.pos - vec2(0.0, 44.0 + 30.0 * (1.0 - k));
+                let mine = e.who as usize == me;
+                let size = if mine { 24.0 } else { 17.0 };
+                if e.kind == FxKind::Perfect {
+                    wtext("PERFECT", pos, size, alpha(mixc(WHITE, hex(RALLY_PERFECT_COL), 0.5), k), tscale);
+                } else {
+                    let (word, col) = if e.err < 0 { ("EARLY", RALLY_EARLY_COL) } else { ("LATE", RALLY_LATE_COL) };
+                    wtext(&format!("{word} {}ms", e.err.unsigned_abs()), pos, size, alpha(hex(col), k), tscale);
+                }
             }
         }
     }
@@ -3184,6 +3229,14 @@ const RALLY_TRAIL_AMP: f32 = 14.0; // px, waveform displacement of the trail
 const RALLY_FLASH_LIFE: f32 = 0.35; // s, hit / perfect flashes
 const RALLY_SLAM_LIFE: f32 = 0.6; // s, Sub shockwave and score flash
 const RALLY_SLAM_SPEED: f32 = 900.0; // px/s
+const RALLY_STRIKE_W: f32 = 10.0; // px, glow width of a strike line (doubles on the beat)
+const RALLY_RING_BEATS: f32 = 2.0; // approach ring starts closing this many beats before the strike beat
+const RALLY_RING_R: f32 = 110.0; // px, approach ring extra radius at its start
+const RALLY_RING_HOLD: f32 = 0.12; // s, flash at the strike point after the beat
+const RALLY_TEXT_LIFE: f32 = 0.7; // s, PERFECT / EARLY / LATE text
+const RALLY_PERFECT_COL: u32 = 0xfff07a;
+const RALLY_EARLY_COL: u32 = 0x5ad1ff;
+const RALLY_LATE_COL: u32 = 0xff9a3d;
 
 fn rally_col(c: Character) -> Color {
     hex(RALLY_COLS[c.index() as usize % RALLY_COLS.len()])
