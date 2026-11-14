@@ -8,8 +8,8 @@ use std::sync::atomic::AtomicU32;
 use macroquad::math::{vec2, Vec2};
 
 use crate::analysis::{Band, StreamAnalyzer, StreamOut};
-use crate::game::{tile_center, tile_of, Input, World, HEART_R};
-use crate::level::{Ev, COLS, HALF_H, HALF_W, ROWS};
+use crate::game::{tile_of, Input, World, HEART_R};
+use crate::level::{Ev, Pattern, COLS, FAN_STEP, HALF_H, HALF_W, PINCER_OFFSET, PINCER_SPREAD, WALL_GAP_HALF, WALL_HALF};
 use crate::Args;
 
 pub fn run_cli(args: &Args) {
@@ -24,6 +24,245 @@ pub fn run_cli(args: &Args) {
     }
     if let Some(secs) = args.live_probe {
         live_probe(secs);
+    }
+    if args.sim {
+        sim_report(args);
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// Headless balance simulator
+// ---------------------------------------------------------------------------------------------
+
+/// What happened when the bot played one generated level.
+pub struct SimOut {
+    pub first_death: Option<f32>,
+    pub deaths: u32,
+    pub hit_times: Vec<f32>,
+    /// (seconds spent, hits taken) per section kind: Calm, Normal, Intense, Drop.
+    pub by_kind: [(f32, u32); 4],
+    pub heart_broken: Option<f32>,
+    pub level: u32,
+    pub kills: u32,
+    pub max_bullets: usize,
+    pub mean_bullets: f32,
+    pub max_enemies: usize,
+    /// Hits by source: bullet, enemy, tile, laser, wave, heart.
+    pub by_src: [u32; 6],
+    pub by_pat: [u32; 12],
+    pub by_tile: [u32; 9],
+}
+
+/// Bot input with a human-ish reaction delay: movement and dash decisions arrive `delay`
+/// seconds late (aiming is immediate, a mouse is fast).
+struct DelayedBot {
+    q: std::collections::VecDeque<(f32, Input)>,
+    cur: Input,
+    delay: f32,
+}
+
+impl DelayedBot {
+    fn new(delay: f32) -> Self {
+        DelayedBot { q: std::collections::VecDeque::new(), cur: Input::default(), delay }
+    }
+    fn step(&mut self, w: &World, t: f32) -> Input {
+        let raw = bot_input(w);
+        self.q.push_back((t, raw));
+        while let Some(&(qt, inp)) = self.q.front() {
+            if qt <= t - self.delay {
+                self.cur = inp;
+                self.q.pop_front();
+            } else {
+                break;
+            }
+        }
+        Input { mv: self.cur.mv, aim: raw.aim, fire: true, dash: self.cur.dash }
+    }
+}
+
+/// Play `level` with the bot at a fixed 120 Hz step, no window, no audio. On death the bot is
+/// revived so the whole song is measured.
+pub fn simulate(an: &crate::analysis::Analysis, level: &crate::level::Level, diff: f32, bot_delay: f32, song_idx: u32) -> SimOut {
+    use crate::analysis::SectionKind;
+    let mut w = World::new(diff, false);
+    w.begin_song(level.active_secs, song_idx, level.seed);
+    w.beat_len = if level.bpm > 1.0 { 60.0 / level.bpm } else { 0.5 };
+    let mut bot = DelayedBot::new(bot_delay);
+    let dt = 1.0 / 120.0;
+    let mut out = SimOut {
+        first_death: None,
+        deaths: 0,
+        hit_times: Vec::new(),
+        by_kind: [(0.0, 0); 4],
+        heart_broken: None,
+        level: 0,
+        kills: 0,
+        max_bullets: 0,
+        mean_bullets: 0.0,
+        max_enemies: 0,
+        by_src: [0; 6],
+        by_pat: [0; 12],
+        by_tile: [0; 9],
+    };
+    let mut cursor = 0usize;
+    let mut t = 0.0f32;
+    let mut hits_seen = 0u32;
+    let mut bullet_sum = 0.0f64;
+    let mut steps = 0u64;
+    while t < level.duration {
+        w.t = t;
+        while cursor < level.events.len() && level.events[cursor].at() <= t {
+            let e = level.events[cursor];
+            cursor += 1;
+            w.apply(&e);
+        }
+        let silent = an.in_silence(t) && an.in_silence(t + 0.7);
+        let feat = crate::feat_at(an, t);
+        let input = bot.step(&w, t);
+        w.sounds.clear();
+        w.update(dt, t, &input, crate::beat_pos(&level.beats, t), &feat, an.intensity_at(t), !silent);
+        if silent {
+            w.calm_down();
+        }
+        let k = match w.section_kind {
+            SectionKind::Calm => 0,
+            SectionKind::Normal => 1,
+            SectionKind::Intense => 2,
+            SectionKind::Drop => 3,
+        };
+        if !silent {
+            out.by_kind[k].0 += dt;
+        }
+        if w.stats.hits > hits_seen && std::env::var("HL_HITLOG").is_ok() {
+            println!("   hit t={:.1} src={:?} pat={:?} bullet_age={:.2} r={:.0} pos=({:.0},{:.0}) pressure={:.2} pulses_pending={}", t, w.stats.by_src, w.stats.by_pat, w.last_hit_age, w.player.pos.length(), w.player.pos.x, w.player.pos.y, w.pressure(), w.pulses.len());
+        }
+        if w.stats.hits > hits_seen {
+            out.by_kind[k].1 += w.stats.hits - hits_seen;
+            for _ in hits_seen..w.stats.hits {
+                out.hit_times.push(t);
+            }
+            hits_seen = w.stats.hits;
+        }
+        if w.dead {
+            out.deaths += 1;
+            out.first_death.get_or_insert(t);
+            w.dead = false;
+            w.player.hp = w.player.max_hp;
+            w.player.invuln = 2.0;
+        }
+        if w.heart.broken && out.heart_broken.is_none() {
+            out.heart_broken = Some(t);
+        }
+        out.max_bullets = out.max_bullets.max(w.bullets.len());
+        out.max_enemies = out.max_enemies.max(w.enemies.len());
+        bullet_sum += w.bullets.len() as f64;
+        steps += 1;
+        t += dt;
+    }
+    out.by_src = w.stats.by_src;
+    out.by_pat = w.stats.by_pat;
+    out.by_tile = w.stats.by_tile;
+    out.level = w.player.level;
+    out.kills = w.stats.kills;
+    out.mean_bullets = (bullet_sum / steps.max(1) as f64) as f32;
+    out
+}
+
+fn sim_report(args: &Args) {
+    let mut files = args.files.clone();
+    if args.sample > 0 && files.len() > args.sample {
+        let n = files.len();
+        files = (0..args.sample).map(|k| files[k * n / args.sample].clone()).collect();
+    }
+    if files.is_empty() {
+        println!("--sim needs audio files or folders");
+        return;
+    }
+    let delay = args.bot_delay / 1000.0;
+    let diffs: Vec<usize> = if args.diff_set { vec![args.diff] } else { vec![0, 1, 2] };
+    println!("bot reaction delay {:.0} ms, {} run(s) per difficulty; death = first death time, the bot is revived to finish the song", args.bot_delay, args.runs.max(1));
+    println!("{:<26} {:>4} {:>4} {:<6} {:>5} {:>4} {:>4} {:>19} {:>17} {:>5} {:>3} {:>3} {:>2}  hits per 30 s", "track", "dur", "bpm", "diff", "death", "dths", "hits", "hits/min C/N/I/D", "src b/e/t/l/w/h", "heart", "lvl", "bul", "en");
+    let mut src_tot = [[0u32; 6]; 3];
+    let mut pat_tot = [[0u32; 12]; 3];
+    let mut tile_tot = [[0u32; 9]; 3];
+    let mut totals = [(0u32, 0u32, 0.0f32, 0.0f32); 3];
+    for path in &files {
+        let progress = AtomicU32::new(0);
+        let stage = AtomicU32::new(0);
+        let loaded = match crate::load_track(path, 0, 1.0, &progress, &stage) {
+            Ok(l) => l,
+            Err(e) => {
+                println!("{:<34} error: {e}", path.file_stem().and_then(|s| s.to_str()).unwrap_or("?"));
+                continue;
+            }
+        };
+        let name: String = loaded.track.name.chars().take(25).collect();
+        for &di in &diffs {
+            let diff = crate::DIFFS[di].0;
+            for run in 0..args.runs.max(1) {
+                let level = crate::level::generate(&loaded.an, args.seed + run as u64, diff);
+                let o = simulate(&loaded.an, &level, diff, delay, args.song_idx);
+                let per_min = |k: usize| -> String {
+                    let (secs, hits) = o.by_kind[k];
+                    if secs < 5.0 { "  - ".to_string() } else { format!("{:4.1}", hits as f32 * 60.0 / secs) }
+                };
+                let mut buckets = vec![0u32; (level.duration / 30.0) as usize + 1];
+                for &ht in &o.hit_times {
+                    buckets[(ht / 30.0) as usize] += 1;
+                }
+                let bs: Vec<String> = buckets.iter().map(|b| b.to_string()).collect();
+                for k in 0..6 {
+                    src_tot[di][k] += o.by_src[k];
+                }
+                for k in 0..12 {
+                    pat_tot[di][k] += o.by_pat[k];
+                }
+                for k in 0..9 {
+                    tile_tot[di][k] += o.by_tile[k];
+                }
+                let srcs: Vec<String> = o.by_src.iter().map(|b| b.to_string()).collect();
+                println!(
+                    "{:<26} {:>4.0} {:>4.0} {:<6} {:>5} {:>4} {:>4} {:>19} {:>17} {:>5} {:>3} {:>3.0} {:>2}  {}",
+                    name,
+                    level.duration,
+                    level.bpm,
+                    ["chill", "normal", "hard"][di],
+                    o.first_death.map(|d| format!("{d:.0}s")).unwrap_or_else(|| "-".into()),
+                    o.deaths,
+                    o.hit_times.len(),
+                    format!("{} {} {} {}", per_min(0), per_min(1), per_min(2), per_min(3)),
+                    srcs.join("/"),
+                    o.heart_broken.map(|d| format!("{d:.0}s")).unwrap_or_else(|| "-".into()),
+                    o.level,
+                    o.mean_bullets,
+                    o.max_enemies,
+                    bs.join(" ")
+                );
+                let tt = &mut totals[di];
+                tt.0 += 1;
+                tt.1 += (o.deaths == 0) as u32;
+                tt.2 += o.hit_times.len() as f32 * 60.0 / level.duration.max(1.0);
+                tt.3 += o.first_death.unwrap_or(level.duration) / level.duration.max(1.0);
+            }
+        }
+    }
+    println!();
+    for &di in &diffs {
+        let (n, clears, hpm, frac) = totals[di];
+        if n > 0 {
+            println!(
+                "{:<6} runs {:>3}  no-death clears {:>3} ({:>3.0}%)  mean hits/min {:.2}  mean survived fraction {:.2}  hits by src b/e/t/l/w/h {:?}",
+                ["chill", "normal", "hard"][di],
+                n,
+                clears,
+                clears as f32 * 100.0 / n as f32,
+                hpm / n as f32,
+                frac / n as f32,
+                src_tot[di]
+            );
+            println!("       bullet hits by pattern ring/fan/spiral/cross/flower/arc/wall/burst/pincer/dart/orbiter/elite {:?}", pat_tot[di]);
+            println!("       tile hits by checker/rows/cols/ring/cross/diag/scatter/colband/rowband {:?}", tile_tot[di]);
+        }
     }
 }
 
@@ -64,6 +303,10 @@ fn analyze_report(path: &Path, args: &Args) {
             Ev::Pulse { count, .. } => {
                 bullets += count as usize;
                 1
+            }
+            Ev::Tick { .. } => {
+                bullets += 1;
+                9
             }
             Ev::Spawn { .. } => 2,
             Ev::Shards { .. } => 3,
@@ -292,89 +535,155 @@ fn gen_test_track(out: &Path) -> Result<(), String> {
 // Self-test bot
 // ---------------------------------------------------------------------------------------------
 
+/// Plays the game the way a person does: looks a short way ahead along each direction it could
+/// move, scores what it would run into (bullets, enemies, armed tiles, lasers, shockwaves and
+/// the Heart's announced danger zones) and takes the safest one.
 pub fn bot_input(w: &World) -> Input {
+    const SPEED: f32 = 430.0;
+    const STEPS: [f32; 6] = [0.1, 0.22, 0.36, 0.52, 0.7, 0.9];
     let p = w.player.pos;
-    let mut force = Vec2::ZERO;
+    let pi = std::f32::consts::PI;
+    let wrap = |a: f32| -> f32 {
+        let mut x = a.rem_euclid(TAU);
+        if x > pi {
+            x -= TAU;
+        }
+        x
+    };
 
-    // Hold a comfortable orbit around the Heart.
-    let d = p.length().max(1.0);
-    let want = 300.0;
-    force += p / d * (want - d) * 0.012;
-    // drift tangentially so the bot keeps moving
-    force += vec2(-p.y, p.x) / d * 0.35;
-
-    for b in &w.bullets {
-        let to = p - b.pos;
-        let dist = to.length().max(1.0);
-        if dist < 170.0 {
-            // weigh bullets that are heading at us
-            let closing = b.vel.normalize_or_zero().dot(to / dist).max(0.0);
-            force += to / dist * (170.0 - dist) / 170.0 * (1.2 + 2.5 * closing);
-        }
-    }
-    for e in &w.enemies {
-        let to = p - e.pos;
-        let dist = to.length().max(1.0);
-        if dist < 190.0 {
-            force += to / dist * (190.0 - dist) / 190.0 * 2.0;
-        }
-    }
-    // Armed tile under us: head for the nearest safe tile.
-    if let Some((c, r)) = tile_of(p) {
-        let tile = &w.tiles[r * COLS + c];
-        if tile.armed && tile.strike_t - w.t < 0.8 {
-            let mut best: Option<(f32, Vec2)> = None;
-            for rr in 0..ROWS {
-                for cc in 0..COLS {
-                    if !w.tiles[rr * COLS + cc].armed {
-                        let tc = tile_center(cc, rr);
-                        if tc.length() < HEART_R + 70.0 {
-                            continue;
-                        }
-                        let dd = tc.distance(p);
-                        if best.map(|b| dd < b.0).unwrap_or(true) {
-                            best = Some((dd, tc));
-                        }
-                    }
-                }
-            }
-            if let Some((_, tc)) = best {
-                force += (tc - p).normalize_or_zero() * 4.0;
-            }
-        }
-    }
-    for l in &w.lasers {
-        let pos = if w.t < l.t0 { l.from } else { l.pos_at(w.t) };
-        let delta = if l.horizontal { p.y - pos } else { p.x - pos };
-        if delta.abs() < 120.0 && w.t > l.t0 - 0.6 {
-            let push = delta.signum() * (120.0 - delta.abs()) / 120.0 * 3.0;
-            if l.horizontal {
-                force.y += push;
-            } else {
-                force.x += push;
-            }
-        }
-    }
-    // Pickups pull gently.
-    let mut nearest: Option<(f32, Vec2)> = None;
+    // Where would we like to be if nothing threatened us? Near pickups, else a loose orbit.
+    let mut goal: Option<Vec2> = None;
+    let mut best_d = 460.0f32;
     for s in &w.shards {
         let dd = s.pos.distance(p);
-        if dd < 420.0 && nearest.map(|n| dd < n.0).unwrap_or(true) {
-            nearest = Some((dd, s.pos));
+        if dd < best_d {
+            best_d = dd;
+            goal = Some(s.pos);
         }
     }
     for o in &w.orbs {
-        let dd = o.pos.distance(p);
-        if nearest.map(|n| dd < n.0 + 200.0).unwrap_or(true) {
-            nearest = Some((dd, o.pos));
+        let dd = o.pos.distance(p) - 250.0;
+        if dd < best_d {
+            best_d = dd;
+            goal = Some(o.pos);
         }
     }
-    if let Some((_, tp)) = nearest {
-        force += (tp - p).normalize_or_zero() * 0.9;
+
+    // In-flight danger of standing at `q` at time offset `tau`.
+    let danger = |q: Vec2, tau: f32| -> f32 {
+        let mut c = 0.0f32;
+        let near = 1.0 / (0.25 + tau);
+        for b in &w.bullets {
+            if b.fade < 1.0 {
+                continue;
+            }
+            let bp = b.pos + b.vel * tau;
+            let d = bp.distance(q);
+            let safe = b.r + 26.0;
+            if d < safe {
+                c += (1.0 + 3.0 * (safe - d) / safe) * near;
+            }
+        }
+        for e in &w.enemies {
+            let ep = e.pos + e.vel * tau * 0.8;
+            let d = ep.distance(q);
+            let safe = e.r + 46.0;
+            if d < safe {
+                c += (1.5 + 3.0 * (safe - d) / safe) * near;
+            }
+        }
+        for pt in &w.portals {
+            if pt.t1 - w.t < tau + 0.2 && pt.pos.distance(q) < 70.0 {
+                c += 1.5;
+            }
+        }
+        // The Heart itself.
+        let dq = q.length();
+        if dq < HEART_R + 60.0 {
+            c += 3.0 * near;
+        }
+        // Tiles: being on a tile at the moment it slams.
+        if let Some((tc, tr)) = tile_of(q) {
+            let tile = &w.tiles[tr * COLS + tc];
+            if tile.armed {
+                let until = tile.strike_t - (w.t + tau);
+                if until.abs() < 0.14 {
+                    c += 8.0;
+                } else if until > 0.0 && until < 0.5 {
+                    c += 1.2 * (0.5 - until);
+                }
+            }
+        }
+        for l in &w.lasers {
+            let lt = w.t + tau;
+            if lt >= l.t0 - 0.05 && lt <= l.t0 + l.dur + 0.05 {
+                let pos = l.pos_at(lt);
+                let delta = if l.horizontal { q.y - pos } else { q.x - pos };
+                if delta.abs() < 34.0 {
+                    c += 8.0;
+                } else if delta.abs() < 90.0 {
+                    c += 0.6;
+                }
+            }
+        }
+        for wv in &w.waves {
+            let lt = w.t + tau;
+            if lt >= wv.t0 && (dq - wv.radius(lt)).abs() < 30.0 && !wv.in_gap(q.y.atan2(q.x)) {
+                c += 8.0;
+            }
+        }
+        // Announced pulses: do not be inside the zone when the bullets get here.
+        let qang = q.y.atan2(q.x);
+        for pp in &w.pulses {
+            let arrive = (pp.t - w.t).max(0.0) + (dq - HEART_R).max(0.0) / pp.speed.max(120.0);
+            if tau + 0.25 < arrive * 0.6 || pp.count == 0 {
+                continue;
+            }
+            let off = wrap(qang - pp.aim);
+            let inside = match pp.pattern {
+                Pattern::Fan => off.abs() < FAN_STEP * (pp.count.max(1) as f32 - 1.0) * 0.5 + 0.1,
+                Pattern::Burst => off.abs() < 0.12,
+                Pattern::Pincer => (off.abs() - PINCER_OFFSET).abs() < PINCER_SPREAD * 0.5 + 0.08,
+                Pattern::Wall => off.abs() < WALL_HALF + 0.06 && (off - pp.rot).abs() > WALL_GAP_HALF * 0.55,
+                Pattern::Cross => (wrap(off * 4.0) / 4.0).abs() < 0.1,
+                _ => false,
+            };
+            if inside {
+                c += 1.6;
+            }
+        }
+        c
+    };
+
+    let mut best_dir = Vec2::ZERO;
+    let mut best_cost = f32::MAX;
+    let cur = if w.player.vel.length() > 60.0 { w.player.vel.normalize() } else { Vec2::ZERO };
+    for k in 0..17 {
+        let dir = if k == 16 { Vec2::ZERO } else { vec2((k as f32 * TAU / 16.0).cos(), (k as f32 * TAU / 16.0).sin()) };
+        let mut cost = 0.0f32;
+        let mut q = p;
+        for &tau in STEPS.iter() {
+            q = p + dir * SPEED * tau;
+            q.x = q.x.clamp(-HALF_W + 14.0, HALF_W - 14.0);
+            q.y = q.y.clamp(-HALF_H + 14.0, HALF_H - 14.0);
+            cost += danger(q, tau);
+        }
+        // Preferences (small next to any real danger).
+        let dq = q.length();
+        cost += ((dq - 320.0).abs() / 320.0) * 0.5;
+        cost += ((q.x.abs() / HALF_W).powi(6) + (q.y.abs() / HALF_H).powi(6)) * 0.8;
+        if let Some(g) = goal {
+            cost += (q.distance(g) / 900.0) * 0.7;
+        }
+        cost -= dir.dot(cur) * 0.12; // keep going the way we are going
+        if k == 16 {
+            cost += 0.05;
+        }
+        if cost < best_cost {
+            best_cost = cost;
+            best_dir = dir;
+        }
     }
-    // Keep off the walls.
-    force.x -= (p.x / HALF_W).powi(5) * 2.0;
-    force.y -= (p.y / HALF_H).powi(5) * 2.0;
 
     // Aim at the nearest enemy, else the Heart.
     let mut aim = Vec2::ZERO;
@@ -395,11 +704,7 @@ pub fn bot_input(w: &World) -> Input {
             }
         }
     }
-    let danger = w.bullets.iter().any(|b| b.pos.distance(p) < 26.0);
-    Input {
-        mv: if force.length() > 0.15 { force.normalize() } else { Vec2::ZERO },
-        aim,
-        fire: true,
-        dash: danger && w.player.dash_cd <= 0.0,
-    }
+    // Dash when something is about to connect and walking will not fix it.
+    let imminent = danger(p + best_dir * SPEED * 0.08, 0.08) > 6.0 || w.bullets.iter().any(|b| b.fade >= 1.0 && b.pos.distance(p) < 24.0);
+    Input { mv: best_dir, aim, fire: true, dash: imminent && w.player.dash_cd <= 0.0 }
 }

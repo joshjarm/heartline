@@ -14,6 +14,38 @@ use rustfft::{Fft, FftPlanner};
 
 pub const N_SPEC: usize = 24;
 
+/// Tempo search range.
+const MIN_BPM: f32 = 55.0;
+const MAX_BPM: f32 = 220.0;
+/// A different metrical level must beat the autocorrelation pick by this factor to replace it.
+const TEMPO_SWITCH_MARGIN: f32 = 1.1;
+/// Tempi below this are doubled.
+const MIN_PLAY_BPM: f32 = 72.0;
+/// Added to every reported onset / beat time to cancel the STFT front-end's measured timing bias.
+const ONSET_BIAS_S: f32 = 0.0038;
+/// How much of the mid band's per-bin flux is removed from the low band before kick picking.
+const KICK_BROADBAND: f32 = 1.0;
+/// Half-width (in beats) of the local line fit that smooths beat times.
+const BEAT_FIT_HALF: usize = 4;
+/// Downbeat evidence weights: kick accent, harmonic change, backbeat (snare on the next beat).
+const DOWNBEAT_W: [f32; 3] = [1.0, 0.8, 0.5];
+/// Intensity mix: loudness, onset density, spectral fullness, low end (all z-scored per song).
+const INTENSITY_W: [f32; 4] = [0.4, 0.25, 0.2, 0.15];
+/// Section labels by duration-weighted quantile of section energy within the song.
+const SECTION_CALM_Q: f32 = 0.22;
+const SECTION_INTENSE_Q: f32 = 0.62;
+const SECTION_HYST: f32 = 0.05;
+/// An Intense section is a Drop when its energy jumps this many section-sd above the previous one.
+const DROP_JUMP_SD: f32 = 0.7;
+/// ... or when its energy quantile within the song jumps by at least this much.
+const DROP_JUMP_Q: f32 = 0.4;
+/// beat_conf = smoothstep of (0.7 * grid fit + 0.3 * periodicity) between these.
+const BEAT_CONF_LO: f32 = 0.3;
+const BEAT_CONF_HI: f32 = 0.75;
+/// Live beat confidence ramps from 0 to 1 as the envelope's normalised autocorrelation at the beat goes LO..HI.
+const LIVE_CONF_LO: f32 = 0.1;
+const LIVE_CONF_HI: f32 = 0.4;
+
 #[derive(Clone, Copy, Debug)]
 pub struct Feat {
     pub rms: f32,
@@ -84,6 +116,10 @@ pub struct Analysis {
     pub phrases: Vec<(f32, f32)>,
     pub silences: Vec<(f32, f32)>,
     pub seed: u64,
+    /// 0..1 confidence that the beat grid is musically meaningful (near 0 for free-time pieces).
+    pub beat_conf: f32,
+    /// 0..1 confidence in the bar phase (`downbeat`): margin of the winning phase over the runner-up.
+    pub downbeat_conf: f32,
 }
 
 impl Analysis {
@@ -109,6 +145,8 @@ impl Analysis {
 struct Raw {
     rms: f32,
     flux: [f32; 3],
+    /// Low-band flux with the broadband (snare / hat / crash) part removed: drives kick onsets.
+    kick: f32,
     energy: [f32; 3],
     spec: [f32; N_SPEC],
 }
@@ -203,7 +241,9 @@ impl Spectral {
             energy[b] = (e / (hi - lo) as f32).sqrt();
         }
         let mut flux = [0.0f32; 3];
+        let mut kick = 0.0f32;
         if self.has_prev {
+            let mut per_bin = [0.0f32; 3];
             for (b, &(lo, hi)) in self.band_bins.iter().enumerate() {
                 let mut f = 0.0;
                 for k in lo..hi {
@@ -216,7 +256,10 @@ impl Spectral {
                     }
                 }
                 flux[b] = f / ((hi - lo) as f32).sqrt();
+                per_bin[b] = f / (hi - lo) as f32;
             }
+            let (lo, hi) = self.band_bins[0];
+            kick = (per_bin[0] - KICK_BROADBAND * per_bin[1]).max(0.0) * ((hi - lo) as f32).sqrt();
         }
         self.has_prev = true;
         let mut spec = [0.0f32; N_SPEC];
@@ -227,7 +270,7 @@ impl Spectral {
             }
             spec[i] = s / (hi - lo) as f32;
         }
-        Raw { rms, flux, energy, spec }
+        Raw { rms, flux, kick, energy, spec }
     }
 }
 
@@ -284,6 +327,19 @@ struct PickParams {
     delta: f32,
 }
 
+/// Sub-frame position of a local maximum (parabolic interpolation), in frames, within +-0.5.
+fn peak_offset(env: &[f32], i: usize) -> f32 {
+    if i == 0 || i + 1 >= env.len() {
+        return 0.0;
+    }
+    let (a, b, c) = (env[i - 1], env[i], env[i + 1]);
+    let d = a - 2.0 * b + c;
+    if d.abs() < 1e-12 {
+        return 0.0;
+    }
+    (0.5 * (a - c) / d).clamp(-0.5, 0.5)
+}
+
 fn pick_onsets(env: &[f32], rms: &[f32], hop_dt: f32, band: Band, p: &PickParams) -> Vec<Onset> {
     let n = env.len();
     if n < 16 {
@@ -331,19 +387,19 @@ fn pick_onsets(env: &[f32], rms: &[f32], hop_dt: f32, band: Band, p: &PickParams
         out.push((i, v));
     }
     out.into_iter()
-        .map(|(i, v)| Onset { t: i as f32 * hop_dt, band, strength: (v / 1.3).min(1.0) })
+        .map(|(i, v)| Onset { t: (i as f32 + peak_offset(env, i)) * hop_dt + ONSET_BIAS_S, band, strength: (v / 1.3).min(1.0) })
         .collect()
 }
 
 /// Returns the beat period in frames.
 fn estimate_tempo(o: &[f32], hop_dt: f32) -> Option<f32> {
     let n = o.len();
-    let lo = ((60.0 / 220.0) / hop_dt).floor() as usize;
-    let hi = ((60.0 / 55.0) / hop_dt).ceil() as usize;
+    let lo = ((60.0 / MAX_BPM) / hop_dt).floor() as usize;
+    let hi = ((60.0 / MIN_BPM) / hop_dt).ceil() as usize;
     if n < hi * 6 || lo < 2 {
         return None;
     }
-    let max_lag = hi * 2 + 2;
+    let max_lag = hi * 4 + 4;
     let mut ac = vec![0.0f32; max_lag + 1];
     for (lag, slot) in ac.iter_mut().enumerate().skip(1) {
         let mut s = 0.0f64;
@@ -380,6 +436,79 @@ fn estimate_tempo(o: &[f32], hop_dt: f32) -> Option<f32> {
         }
     }
     Some(period)
+}
+
+/// Mean onset strength at the beat, half-beat, quarter-beat and third-beat positions of a beat grid.
+fn grid_salience(o: &[f32], beats: &[usize]) -> [f32; 4] {
+    let n = o.len() as isize;
+    let at = |x: f32| -> f32 {
+        let i = x.round() as isize;
+        let mut m = 0.0f32;
+        for j in (i - 1)..=(i + 1) {
+            if j >= 0 && j < n {
+                m = m.max(o[j as usize]);
+            }
+        }
+        m
+    };
+    let mut acc = [0.0f32; 4];
+    let mut cnt = 0.0f32;
+    for w in beats.windows(2) {
+        let (a, b) = (w[0] as f32, w[1] as f32);
+        let d = b - a;
+        acc[0] += at(a);
+        acc[1] += at(a + d * 0.5);
+        acc[2] += 0.5 * (at(a + d * 0.25) + at(a + d * 0.75));
+        acc[3] += 0.5 * (at(a + d / 3.0) + at(a + d * 2.0 / 3.0));
+        cnt += 1.0;
+    }
+    for v in acc.iter_mut() {
+        *v /= cnt.max(1.0);
+    }
+    acc
+}
+
+/// Log-gaussian tempo preference centred on 120 BPM; `sigma` in octaves.
+fn tempo_prior(bpm: f32, sigma: f32) -> f32 {
+    let oct = (bpm / 120.0).log2() / sigma;
+    (-0.5 * oct * oct).exp()
+}
+
+/// How well a beat grid explains the onset envelope as a metrical hierarchy. A binary grid wants
+/// strong beats, then half-beats, then quarter-beats, and little at the thirds; a ternary grid
+/// (6/8, shuffle) wants strong beats and thirds.
+fn metrical_score(sal: &[f32; 4]) -> f32 {
+    let [beat, half, quart, third] = *sal;
+    let binary = beat + 0.6 * half + 0.3 * quart - 0.4 * third;
+    let ternary = beat + 0.6 * third - 0.4 * half;
+    binary.max(0.9 * ternary)
+}
+
+/// Resolves 4:3 and 3:2 tempo confusions. Autocorrelation alone cannot tell a beat from three
+/// sixteenths (3+3+2 patterns) or a dotted quarter, but the grid tracked at the wrong period has a
+/// tell-tale ternary subdivision and weaker beats. Octave (2:1) choices are left to the
+/// autocorrelation prior. Returns the chosen period and its tracked beats.
+fn choose_metrical_level(o: &[f32], p0: f32, hop_dt: f32) -> (f32, Vec<usize>) {
+    let base = track_beats(o, p0);
+    let bpm0 = 60.0 / (p0 * hop_dt);
+    let s0 = metrical_score(&grid_salience(o, &base)) * tempo_prior(bpm0, 1.2);
+    let mut best = (p0, base, s0 * TEMPO_SWITCH_MARGIN);
+    for r in [4.0f32 / 3.0, 0.75, 2.0 / 3.0, 1.5] {
+        let p = p0 * r;
+        let bpm = 60.0 / (p * hop_dt);
+        if !(MIN_BPM..=MAX_BPM).contains(&bpm) {
+            continue;
+        }
+        let b = track_beats(o, p);
+        if b.len() < 4 {
+            continue;
+        }
+        let s = metrical_score(&grid_salience(o, &b)) * tempo_prior(bpm, 1.2);
+        if s > best.2 {
+            best = (p, b, s);
+        }
+    }
+    (best.0, best.1)
 }
 
 /// Dynamic-programming beat tracker (after Ellis 2007). Returns beat frame indices.
@@ -473,6 +602,276 @@ fn track_beats(o: &[f32], period: f32) -> Vec<usize> {
     beats
 }
 
+/// Turns DP beat frames into smooth, sub-frame beat times: each beat snaps to the parabolic peak of
+/// the onset envelope when one is within a frame, then a local linear fit over +-4 beats removes
+/// the frame-quantisation jitter while still following tempo drift.
+fn refine_beats(o: &[f32], frames: &[usize], hop_dt: f32) -> Vec<f32> {
+    let n = o.len();
+    let raw: Vec<f32> = frames
+        .iter()
+        .map(|&f| {
+            let mut best = f;
+            for j in f.saturating_sub(1)..=(f + 1).min(n.saturating_sub(1)) {
+                if o[j] > o[best] {
+                    best = j;
+                }
+            }
+            if best > 0 && best + 1 < n && o[best] >= o[best - 1] && o[best] >= o[best + 1] && o[best] > 0.0 {
+                best as f32 + peak_offset(o, best)
+            } else {
+                f as f32
+            }
+        })
+        .collect();
+    let m = raw.len();
+    (0..m)
+        .map(|i| {
+            let a = i.saturating_sub(BEAT_FIT_HALF);
+            let z = (i + BEAT_FIT_HALF + 1).min(m);
+            if z - a < 3 {
+                return raw[i] * hop_dt + ONSET_BIAS_S;
+            }
+            // Least squares t = c0 + c1 * k, evaluated at k = i.
+            let (mut sk, mut st, mut skk, mut skt) = (0.0f64, 0.0f64, 0.0f64, 0.0f64);
+            let cnt = (z - a) as f64;
+            for k in a..z {
+                let (kf, t) = (k as f64, raw[k] as f64);
+                sk += kf;
+                st += t;
+                skk += kf * kf;
+                skt += kf * t;
+            }
+            let den = cnt * skk - sk * sk;
+            let fit = if den.abs() > 1e-9 {
+                let c1 = (cnt * skt - sk * st) / den;
+                let c0 = (st - c1 * sk) / cnt;
+                (c0 + c1 * i as f64) as f32
+            } else {
+                raw[i]
+            };
+            // Keep real expressive deviations larger than a frame or so.
+            let t = if (fit - raw[i]).abs() < 1.5 { fit } else { raw[i] };
+            t * hop_dt + ONSET_BIAS_S
+        })
+        .collect()
+}
+
+/// Picks which of every 4 beats is the bar start. Per beat: kick accent (low band), backbeat accent
+/// (mid band, which belongs on 2 and 4) and harmonic change (spectral-shape difference between the
+/// beat before and after). Each is z-scored over the song; the phase with the best mean wins.
+/// Returns (index of first downbeat in 0..4, confidence 0..1).
+fn choose_downbeat(beats: &[f32], kick: &[f32], mid: &[f32], spec: &[[f32; N_SPEC]], hop_dt: f32) -> (usize, f32) {
+    let nb = beats.len();
+    let frames = kick.len();
+    if nb < 12 || frames == 0 {
+        return (0, 0.0);
+    }
+    let fr = |t: f32| ((t / hop_dt).round().max(0.0) as usize).min(frames - 1);
+    let peak = |env: &[f32], t: f32| -> f32 {
+        let f = fr(t);
+        let mut m = 0.0f32;
+        for j in f.saturating_sub(2)..=(f + 2).min(frames - 1) {
+            m = m.max(env[j]);
+        }
+        m
+    };
+    let mean_spec = |t0: f32, t1: f32| -> [f32; N_SPEC] {
+        let (a, z) = (fr(t0), fr(t1).max(fr(t0) + 1).min(frames));
+        let mut m = [0.0f32; N_SPEC];
+        for f in a..z {
+            for k in 0..N_SPEC {
+                m[k] += spec[f][k];
+            }
+        }
+        for v in m.iter_mut() {
+            *v /= (z - a).max(1) as f32;
+        }
+        m
+    };
+    let mut kz = Vec::with_capacity(nb);
+    let mut sz = Vec::with_capacity(nb);
+    let mut hz = Vec::with_capacity(nb);
+    for i in 0..nb {
+        kz.push(peak(kick, beats[i]));
+        sz.push(peak(mid, beats[i]));
+        let h = if i >= 1 && i + 1 < nb {
+            // Skip the first ~60 ms after the beat so the hit itself does not count as a change.
+            let before = mean_spec(beats[i - 1] + 0.06, beats[i]);
+            let after = mean_spec(beats[i] + 0.06, beats[i + 1]);
+            // Harmonic region only (roughly 80 Hz - 2.5 kHz).
+            (3..18).map(|k| (after[k] - before[k]).abs()).sum::<f32>()
+        } else {
+            0.0
+        };
+        hz.push(h);
+    }
+    for v in [&mut kz, &mut sz, &mut hz] {
+        let (m, sd) = mean_std(v);
+        for x in v.iter_mut() {
+            *x = if sd > 1e-9 { (*x - m) / sd } else { 0.0 };
+        }
+    }
+    let mut score = [0.0f32; 4];
+    let mut cnt = [0.0f32; 4];
+    for i in 0..nb {
+        // A downbeat at phase p wants: kick here, harmonic change here, backbeat one beat later.
+        let back = if i + 1 < nb { sz[i + 1] } else { 0.0 };
+        let v = DOWNBEAT_W[0] * kz[i] + DOWNBEAT_W[1] * hz[i] + DOWNBEAT_W[2] * (back - sz[i]);
+        score[i % 4] += v;
+        cnt[i % 4] += 1.0;
+    }
+    for p in 0..4 {
+        score[p] /= cnt[p].max(1.0);
+    }
+    let mut order = [0usize, 1, 2, 3];
+    order.sort_by(|&a, &b| score[b].partial_cmp(&score[a]).unwrap_or(std::cmp::Ordering::Equal));
+    let conf = ((score[order[0]] - score[order[1]]) / 0.4).clamp(0.0, 1.0);
+    (order[0], conf)
+}
+
+/// Labels sections relative to the song's own dynamics. Each section's mean energy score is ranked
+/// by duration among all sections: the quietest ~22% of the song is Calm, the loudest ~38% Intense,
+/// the rest Normal. An Intense section entered from a clearly quieter one becomes a Drop. Small
+/// differences near a threshold keep the previous label so labels do not flap.
+fn label_sections(edges: &[f32], score: &[f32], intensity: &[f32], hop_dt: f32) -> Vec<Section> {
+    let frames = score.len();
+    let mut raw: Vec<(f32, f32, f32, f32)> = Vec::new(); // t0, t1, mean score, mean intensity
+    for w in edges.windows(2) {
+        let (t0, t1) = (w[0], w[1]);
+        if t1 - t0 < 0.05 || frames == 0 {
+            continue;
+        }
+        let a = ((t0 / hop_dt) as usize).min(frames - 1);
+        let z = ((t1 / hop_dt) as usize).clamp(a + 1, frames);
+        let len = (z - a) as f32;
+        let sc = score[a..z].iter().sum::<f32>() / len;
+        let si = intensity[a..z].iter().sum::<f32>() / len;
+        raw.push((t0, t1, sc, si));
+    }
+    let total: f32 = raw.iter().map(|r| r.1 - r.0).sum::<f32>().max(1e-3);
+    let (_, sc_sd) = mean_std(&raw.iter().map(|r| r.2).collect::<Vec<f32>>());
+    let mut out: Vec<Section> = Vec::with_capacity(raw.len());
+    let mut prev_q = 0.5f32;
+    for (idx, r) in raw.iter().enumerate() {
+        // Duration-weighted quantile of this section's score among all sections.
+        let mut below = 0.0f32;
+        let mut same = 0.0f32;
+        for q in &raw {
+            if q.2 < r.2 {
+                below += q.1 - q.0;
+            } else if q.2 == r.2 {
+                same += q.1 - q.0;
+            }
+        }
+        let qn = (below + 0.5 * same) / total;
+        let prev = out.last().copied();
+        let pick = |qv: f32| {
+            if qv < SECTION_CALM_Q {
+                SectionKind::Calm
+            } else if qv > SECTION_INTENSE_Q {
+                SectionKind::Intense
+            } else {
+                SectionKind::Normal
+            }
+        };
+        let mut kind = pick(qn);
+        if let Some(p) = prev {
+            let pk = if p.kind == SectionKind::Drop { SectionKind::Intense } else { p.kind };
+            let near_calm = (qn - SECTION_CALM_Q).abs() < SECTION_HYST;
+            let near_int = (qn - SECTION_INTENSE_Q).abs() < SECTION_HYST;
+            if (near_calm && matches!(pk, SectionKind::Calm | SectionKind::Normal) && matches!(kind, SectionKind::Calm | SectionKind::Normal))
+                || (near_int && matches!(pk, SectionKind::Intense | SectionKind::Normal) && matches!(kind, SectionKind::Intense | SectionKind::Normal))
+            {
+                kind = pk;
+            }
+            let pr = &raw[idx - 1];
+            if kind == SectionKind::Intense
+                && matches!(p.kind, SectionKind::Calm | SectionKind::Normal)
+                && sc_sd > 1e-6
+                && ((r.2 - pr.2) / sc_sd > DROP_JUMP_SD || qn - prev_q >= DROP_JUMP_Q)
+            {
+                kind = SectionKind::Drop;
+            }
+        }
+        out.push(Section { t0: r.0, t1: r.1, intensity: r.3, kind });
+        prev_q = qn;
+    }
+    out
+}
+
+/// Chance-corrected fraction of strong onsets that land within 25 ms of the beat grid's 16th-note
+/// (or triplet) subdivisions: ~0 for a grid unrelated to the music, ~0.7-0.9 for a well-locked grid.
+fn grid_fit(onsets: &[Onset], beats: &[f32]) -> f32 {
+    if beats.len() < 8 {
+        return 0.0;
+    }
+    let (mut hit, mut chance, mut n) = ([0.0f32; 2], [0.0f32; 2], 0.0f32);
+    for o in onsets.iter().filter(|o| o.strength >= 0.5) {
+        let i = beats.partition_point(|&b| b <= o.t);
+        if i == 0 || i >= beats.len() {
+            continue;
+        }
+        let (a, b) = (beats[i - 1], beats[i]);
+        if b <= a {
+            continue;
+        }
+        for (g, div) in [4.0f32, 3.0].iter().enumerate() {
+            let sub = (b - a) / div;
+            let x = (o.t - a) / sub;
+            let d = (x - x.round()).abs() * sub;
+            if d <= 0.025 {
+                hit[g] += 1.0;
+            }
+            chance[g] += (0.05 / sub).min(1.0);
+        }
+        n += 1.0;
+    }
+    if n < 16.0 {
+        return 0.0;
+    }
+    // Binary (16ths) or ternary (triplet 8ths, for shuffle / 6/8), whichever fits better.
+    (0..2)
+        .map(|g| {
+            let (h, c) = (hit[g] / n, chance[g] / n);
+            ((h - c) / (1.0 - c).max(0.05)).clamp(0.0, 1.0)
+        })
+        .fold(0.0f32, f32::max)
+}
+
+/// Normalised autocorrelation of the onset envelope at one and two beat periods (0..1): how
+/// strongly the music repeats at the detected tempo.
+fn periodicity(o: &[f32], bpm: f32, hop_dt: f32) -> f32 {
+    if bpm <= 1.0 {
+        return 0.0;
+    }
+    let p = 60.0 / bpm / hop_dt;
+    let n = o.len();
+    let (m, _) = mean_std(o);
+    let ac = |lag: usize| -> f32 {
+        if lag == 0 || lag >= n {
+            return 0.0;
+        }
+        let mut s = 0.0f64;
+        for i in 0..n - lag {
+            s += ((o[i] - m) * (o[i + lag] - m)) as f64;
+        }
+        (s / (n - lag) as f64) as f32
+    };
+    let a0 = ac_zero(o, m);
+    if a0 <= 1e-9 {
+        return 0.0;
+    }
+    let best = |c: f32| -> f32 {
+        let l = c.round() as usize;
+        ac(l.saturating_sub(1)).max(ac(l)).max(ac(l + 1))
+    };
+    (0.5 * (best(p) + best(2.0 * p)) / a0).clamp(0.0, 1.0)
+}
+
+fn ac_zero(o: &[f32], m: f32) -> f32 {
+    o.iter().map(|v| (v - m) * (v - m)).sum::<f32>() / o.len().max(1) as f32
+}
+
 // ---------------------------------------------------------------------------------------------
 // Offline analysis
 // ---------------------------------------------------------------------------------------------
@@ -488,6 +887,7 @@ pub fn analyze(mono: &[f32], sr: u32, progress: &AtomicU32) -> Analysis {
     let mut flux: [Vec<f32>; 3] = [Vec::with_capacity(frames), Vec::with_capacity(frames), Vec::with_capacity(frames)];
     let mut energy: [Vec<f32>; 3] = [Vec::with_capacity(frames), Vec::with_capacity(frames), Vec::with_capacity(frames)];
     let mut spec: Vec<[f32; N_SPEC]> = Vec::with_capacity(frames);
+    let mut kick: Vec<f32> = Vec::with_capacity(frames);
     let mut frame = vec![0.0f32; n];
     for i in 0..frames {
         let center = (i * hop) as isize;
@@ -503,6 +903,7 @@ pub fn analyze(mono: &[f32], sr: u32, progress: &AtomicU32) -> Analysis {
             energy[b].push(raw.energy[b]);
         }
         spec.push(raw.spec);
+        kick.push(raw.kick);
         if i % 512 == 0 {
             progress.store((i * 1000 / frames) as u32, Ordering::Relaxed);
         }
@@ -517,7 +918,8 @@ pub fn analyze(mono: &[f32], sr: u32, progress: &AtomicU32) -> Analysis {
     let bands = [Band::Low, Band::Mid, Band::High];
     let mut onsets: Vec<Onset> = Vec::new();
     for b in 0..3 {
-        onsets.extend(pick_onsets(&flux[b], &rms, hop_dt, bands[b], &params[b]));
+        let env = if b == 0 { &kick } else { &flux[b] };
+        onsets.extend(pick_onsets(env, &rms, hop_dt, bands[b], &params[b]));
     }
     onsets.sort_by(|a, b| a.t.partial_cmp(&b.t).unwrap());
 
@@ -543,9 +945,15 @@ pub fn analyze(mono: &[f32], sr: u32, progress: &AtomicU32) -> Analysis {
 
     let period = estimate_tempo(&comb, hop_dt);
     let (bpm, mut beats): (f32, Vec<f32>) = match period {
-        Some(p) => {
-            let b = track_beats(&comb, p);
-            (60.0 / (p * hop_dt), b.into_iter().map(|i| i as f32 * hop_dt).collect())
+        Some(p0) => {
+            let (mut p, mut b) = choose_metrical_level(&comb, p0, hop_dt);
+            // Very slow picks are almost always half-time readings of a faster pulse, and a sluggish
+            // pulse plays badly; prefer the double tempo.
+            if 60.0 / (p * hop_dt) < MIN_PLAY_BPM {
+                p *= 0.5;
+                b = track_beats(&comb, p);
+            }
+            (60.0 / (p * hop_dt), refine_beats(&comb, &b, hop_dt))
         }
         None => (0.0, vec![]),
     };
@@ -578,23 +986,17 @@ pub fn analyze(mono: &[f32], sr: u32, progress: &AtomicU32) -> Analysis {
         beats = pre;
     }
 
-    // ---- downbeat phase: kicks tend to sit on beat 1 (and 3) ----
-    let low_p = percentile(&flux[0], 0.98).max(1e-6);
-    let mut phase_score = [0.0f32; 4];
-    for (i, &bt) in beats.iter().enumerate() {
-        let f = (bt / hop_dt).round() as isize;
-        let mut best = 0.0f32;
-        for d in -2..=2 {
-            let j = f + d;
-            if j >= 0 && (j as usize) < frames {
-                best = best.max(flux[0][j as usize] / low_p);
-            }
-        }
-        phase_score[i % 4] += best;
-    }
-    let downbeat = (0..4)
-        .max_by(|&a, &b| phase_score[a].partial_cmp(&phase_score[b]).unwrap())
-        .unwrap_or(0);
+    // ---- downbeat phase: kick on 1 (and 3), backbeat on 2 and 4, chords change on the bar line ----
+    let (downbeat, downbeat_conf) = choose_downbeat(&beats, &kick, &flux[1], &spec, hop_dt);
+    let fit16 = grid_fit(&onsets, &beats);
+    let per_ac = periodicity(&comb, bpm, hop_dt);
+    let beat_conf = if period.is_some() && bpm > 1.0 {
+        let x = 0.7 * fit16 + 0.3 * (per_ac * 1.6).min(1.0);
+        let u = ((x - BEAT_CONF_LO) / (BEAT_CONF_HI - BEAT_CONF_LO)).clamp(0.0, 1.0);
+        u * u * (3.0 - 2.0 * u)
+    } else {
+        0.0
+    };
 
     // ---- normalised features ----
     let rms_ref = percentile(&rms, 0.98).max(1e-4);
@@ -640,30 +1042,43 @@ pub fn analyze(mono: &[f32], sr: u32, progress: &AtomicU32) -> Analysis {
         }
     }
 
-    // ---- intensity (loudness + onset density) ----
+    // ---- intensity: relative to the song itself ----
+    // A per-frame "energy" score from loudness, onset density, arrangement fullness and low end,
+    // z-scored over the audible part of the song, then rank-normalised so every song spans 0..1
+    // with a mean near 0.5 (a quiet ballad and a brick-walled banger get the same spread).
     let db: Vec<f32> = rms.iter().map(|r| 20.0 * (r + 1e-5).log10()).collect();
     let loud = smooth(&db, ((1.5 / hop_dt) as usize).max(1));
-    // Percentiles over the audible part only, so silence does not flatten the scale.
-    let audible: Vec<f32> = (0..frames).filter(|&i| rms_s[i] >= 0.004).map(|i| loud[i]).collect();
-    let (p10, p95) = if audible.len() > 16 {
-        (percentile(&audible, 0.10), percentile(&audible, 0.95))
-    } else {
-        (percentile(&loud, 0.10), percentile(&loud, 0.95))
-    };
-    let span = (p95 - p10).max(3.0);
+    let audible_mask: Vec<bool> = (0..frames).map(|i| rms_s[i] >= 0.004).collect();
     let mut dens = vec![0.0f32; frames];
     for o in &onsets {
-        let i = ((o.t / hop_dt) as usize).min(frames - 1);
+        let i = ((o.t / hop_dt).max(0.0) as usize).min(frames - 1);
         dens[i] += 0.5 + o.strength;
     }
     let dens = smooth(&dens, ((2.0 / hop_dt) as usize).max(1));
-    let dref = percentile(&dens, 0.95).max(1e-6);
+    let full_raw: Vec<f32> = feats.iter().map(|f| f.spec.iter().sum::<f32>() / N_SPEC as f32).collect();
+    let full = smooth(&full_raw, ((1.5 / hop_dt) as usize).max(1));
+    let low_s = smooth(&feats.iter().map(|f| f.low).collect::<Vec<f32>>(), ((1.5 / hop_dt) as usize).max(1));
+    let zs = |x: &[f32]| -> Vec<f32> {
+        let aud: Vec<f32> = (0..frames).filter(|&i| audible_mask[i]).map(|i| x[i]).collect();
+        let (m, sd) = if aud.len() > 16 { mean_std(&aud) } else { mean_std(x) };
+        x.iter().map(|v| if sd > 1e-9 { (v - m) / sd } else { 0.0 }).collect()
+    };
+    let (zl, zd, zf, zb) = (zs(&loud), zs(&dens), zs(&full), zs(&low_s));
+    let energy_score: Vec<f32> = (0..frames)
+        .map(|i| INTENSITY_W[0] * zl[i] + INTENSITY_W[1] * zd[i] + INTENSITY_W[2] * zf[i] + INTENSITY_W[3] * zb[i])
+        .collect();
+    let mut sorted: Vec<f32> = (0..frames).filter(|&i| audible_mask[i]).map(|i| energy_score[i]).collect();
+    if sorted.len() < 16 {
+        sorted = energy_score.clone();
+    }
+    sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let rank = |v: f32| -> f32 {
+        let i = sorted.partition_point(|&x| x < v);
+        let j = sorted.partition_point(|&x| x <= v);
+        ((i + j) as f32 * 0.5 / sorted.len().max(1) as f32).clamp(0.0, 1.0)
+    };
     let intensity: Vec<f32> = (0..frames)
-        .map(|i| {
-            let l = ((loud[i] - p10) / span).clamp(0.0, 1.0);
-            let d = (dens[i] / dref).clamp(0.0, 1.0);
-            (0.65 * l + 0.35 * d).clamp(0.0, 1.0)
-        })
+        .map(|i| if audible_mask[i] { rank(energy_score[i]) } else { 0.5 * rank(energy_score[i]) })
         .collect();
 
     // ---- sections from bar-level novelty ----
@@ -750,32 +1165,8 @@ pub fn analyze(mono: &[f32], sr: u32, progress: &AtomicU32) -> Analysis {
             refined.push(z);
         }
     }
-    let mut sections: Vec<Section> = Vec::new();
-    for w in refined.windows(2) {
-        let (t0, t1) = (w[0], w[1]);
-        if t1 - t0 < 0.05 {
-            continue;
-        }
-        let a = ((t0 / hop_dt) as usize).min(frames - 1);
-        let z = ((t1 / hop_dt) as usize).clamp(a + 1, frames);
-        let si = intensity[a..z].iter().sum::<f32>() / (z - a) as f32;
-        let prev = sections.last().copied();
-        let mut kind = if si < 0.36 {
-            SectionKind::Calm
-        } else if si > 0.64 {
-            SectionKind::Intense
-        } else {
-            SectionKind::Normal
-        };
-        if kind == SectionKind::Intense {
-            if let Some(p) = prev {
-                if si - p.intensity > 0.18 && p.kind != SectionKind::Intense && p.kind != SectionKind::Drop {
-                    kind = SectionKind::Drop;
-                }
-            }
-        }
-        sections.push(Section { t0, t1, intensity: si, kind });
-    }
+    let sections = label_sections(&refined, &energy_score, &intensity, hop_dt);
+    let mut sections = sections;
     if sections.is_empty() {
         sections.push(Section { t0: 0.0, t1: duration, intensity: 0.5, kind: SectionKind::Normal });
     }
@@ -814,7 +1205,7 @@ pub fn analyze(mono: &[f32], sr: u32, progress: &AtomicU32) -> Analysis {
     ) ^ (mono.len() as u64).wrapping_mul(0x9E37_79B9);
 
     progress.store(1000, Ordering::Relaxed);
-    Analysis { duration, hop_dt, feats, intensity, onsets, bpm, beats, downbeat, sections, phrases, silences, seed }
+    Analysis { duration, hop_dt, feats, intensity, onsets, bpm, beats, downbeat, sections, phrases, silences, seed, beat_conf, downbeat_conf }
 }
 
 #[cfg(test)]
@@ -838,6 +1229,307 @@ mod tests {
             t += beat;
         }
         out
+    }
+
+    struct Lcg(u64);
+    impl Lcg {
+        fn f(&mut self) -> f32 {
+            self.0 = self.0.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            ((self.0 >> 33) as f32) / (1u64 << 31) as f32
+        }
+    }
+
+    /// A busy synthetic mix with percussive hits at exactly known sample positions.
+    /// Returns (audio, kick times, snare times, hat times, beat times).
+    pub(super) fn busy_mix(bpm: f32, sr: u32, secs: f32, seed: u64) -> (Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>) {
+        let srf = sr as f32;
+        let n = (secs * srf) as usize;
+        let mut out = vec![0.0f32; n];
+        let mut rng = Lcg(seed);
+        let beat = 60.0 / bpm;
+        // Start at an arbitrary sub-hop offset so hits do not lock to the analysis frames.
+        let t0 = 1.0 + rng.f() * 0.05;
+        let (mut kicks, mut snares, mut hats, mut beats) = (vec![], vec![], vec![], vec![]);
+        let mut k = 0usize;
+        loop {
+            let t = t0 + k as f32 * beat;
+            if t > secs - 1.0 {
+                break;
+            }
+            beats.push(t);
+            let pos = k % 4;
+            if pos == 0 || pos == 2 {
+                kicks.push(t);
+            }
+            if pos == 2 && k % 8 == 6 {
+                kicks.push(t + beat * 0.75);
+            }
+            if pos == 1 || pos == 3 {
+                snares.push(t);
+            }
+            for h in 0..2 {
+                hats.push(t + h as f32 * beat * 0.5);
+            }
+            k += 1;
+        }
+        let tau = std::f32::consts::TAU;
+        let add = |out: &mut Vec<f32>, t: f32, len: f32, f: &mut dyn FnMut(f32) -> f32| {
+            let i0 = (t * srf).round() as usize;
+            for j in 0..(len * srf) as usize {
+                if i0 + j < out.len() {
+                    out[i0 + j] += f(j as f32 / srf);
+                }
+            }
+        };
+        for &t in &kicks {
+            add(&mut out, t, 0.3, &mut |x| (tau * (50.0 + 90.0 * (-x * 25.0).exp()) * x).sin() * (-x * 9.0).exp() * 0.7);
+        }
+        let mut nz = Lcg(seed ^ 0xABCD);
+        for &t in &snares {
+            add(&mut out, t, 0.25, &mut |x| {
+                let noise = nz.f() * 2.0 - 1.0;
+                ((tau * 185.0 * x).sin() * 0.5 + noise * 0.6) * (-x * 18.0).exp() * 0.5
+            });
+        }
+        let mut prev = 0.0f32;
+        for &t in &hats {
+            add(&mut out, t, 0.06, &mut |x| {
+                let w = nz.f() * 2.0 - 1.0;
+                let hp = w - prev;
+                prev = w;
+                hp * (-x * 70.0).exp() * 0.12
+            });
+        }
+        // Bass (smoothly gliding, no attacks) and a sustained pad.
+        for i in 0..n {
+            let t = i as f32 / srf;
+            let bar = ((t - t0) / (4.0 * beat)).floor();
+            let f = 55.0 * if bar as i64 % 2 == 0 { 1.0 } else { 1.122 };
+            let fade = (t.min(secs - t) / 0.5).min(1.0);
+            out[i] += (tau * f * t).sin() * 0.18 * fade;
+            out[i] += ((tau * 220.0 * t).sin() + (tau * 277.2 * t).sin() + (tau * 329.6 * t).sin() + (tau * 440.7 * t).sin()) * 0.03 * fade;
+        }
+        (out, kicks, snares, hats, beats)
+    }
+
+    /// Signed timing errors (s) of detected onsets matched to the nearest true event within 50 ms.
+    pub(super) fn signed_errors(det: &[f32], truth: &[f32]) -> Vec<f32> {
+        det.iter()
+            .filter_map(|&d| {
+                let e = truth.iter().map(|&t| d - t).min_by(|a, b| a.abs().partial_cmp(&b.abs()).unwrap())?;
+                if e.abs() < 0.05 { Some(e) } else { None }
+            })
+            .collect()
+    }
+
+    fn err_stats(e: &[f32]) -> (f32, f32) {
+        let mean = e.iter().sum::<f32>() / e.len().max(1) as f32;
+        let mut a: Vec<f32> = e.iter().map(|x| x.abs()).collect();
+        a.sort_by(|x, y| x.partial_cmp(y).unwrap());
+        let p95 = if a.is_empty() { 1.0 } else { a[((a.len() - 1) as f32 * 0.95) as usize] };
+        (mean, p95)
+    }
+
+    #[test]
+    fn onset_timing_is_unbiased() {
+        for sr in [44_100u32, 48_000] {
+            for (bpm, seed) in [(97.0f32, 1u64), (124.0, 2), (141.0, 3)] {
+                let (mono, kicks, snares, hats, beats) = busy_mix(bpm, sr, 30.0, seed);
+                let an = analyze(&mono, sr, &AtomicU32::new(0));
+                let mut hh = hats.clone();
+                hh.extend(snares.iter().copied());
+                for (band, truth) in [(Band::Low, &kicks), (Band::Mid, &snares), (Band::High, &hh)] {
+                    let det: Vec<f32> = an.onsets.iter().filter(|o| o.band == band && o.strength > 0.3).map(|o| o.t).collect();
+                    let e = signed_errors(&det, truth);
+                    let (mean, p95) = err_stats(&e);
+                    println!("sr {sr} bpm {bpm} {:?}: matched {} / det {} / true {}  mean {:+.1} ms  p95 {:.1} ms", band, e.len(), det.len(), truth.len(), mean * 1000.0, p95 * 1000.0);
+                    assert!(mean.abs() <= 0.005 && p95 <= 0.015, "sr {sr} bpm {bpm} {:?}: mean {:.1} ms p95 {:.1} ms", band, mean * 1e3, p95 * 1e3);
+                    if band != Band::High {
+                        assert!(e.len() as f32 >= 0.9 * truth.len() as f32, "{:?}: only {} of {} hits found", band, e.len(), truth.len());
+                    }
+                }
+                let e = signed_errors(&an.beats, &beats);
+                let (mean, p95) = err_stats(&e);
+                println!("sr {sr} bpm {bpm} beats: bpm det {:.2} n {} mean {:+.1} ms p95 {:.1} ms", an.bpm, e.len(), mean * 1000.0, p95 * 1000.0);
+            }
+        }
+    }
+
+    #[test]
+    fn downbeat_follows_bar_lines() {
+        for (bpm, seed) in [(97.0f32, 4u64), (124.0, 5), (141.0, 6), (110.0, 7)] {
+            let (mono, _, _, _, beats) = busy_mix(bpm, 44_100, 40.0, seed);
+            let an = analyze(&mono, 44_100, &AtomicU32::new(0));
+            // The true bar starts at beats[0] (bass changes there, kick on 1 and 3, snare on 2 and 4).
+            let j = an.beats.iter().enumerate().min_by(|a, b| (a.1 - beats[0]).abs().partial_cmp(&(b.1 - beats[0]).abs()).unwrap()).unwrap().0;
+            assert_eq!(j % 4, an.downbeat % 4, "bpm {bpm}: bar phase off");
+        }
+    }
+
+    /// Kicks in a 3+3+2 eighth-note pattern (the classic 4:3 tempo trap) at a known tempo.
+    fn three_three_two(bpm: f32, sr: u32) -> Vec<f32> {
+        let srf = sr as f32;
+        let n = (40.0 * srf) as usize;
+        let mut out = vec![0.0f32; n];
+        let beat = 60.0 / bpm;
+        let tau = std::f32::consts::TAU;
+        let mut nz = Lcg(99);
+        let mut bar = 0;
+        loop {
+            let t0 = 0.5 + bar as f32 * 4.0 * beat;
+            if t0 > 38.0 {
+                break;
+            }
+            for &e in &[0.0f32, 3.0, 6.0] {
+                let i0 = ((t0 + e * beat * 0.5) * srf) as usize;
+                for k in 0..(0.25 * srf) as usize {
+                    let x = k as f32 / srf;
+                    if i0 + k < n {
+                        out[i0 + k] += (tau * (50.0 + 80.0 * (-x * 30.0).exp()) * x).sin() * (-x * 12.0).exp() * 0.8;
+                    }
+                }
+            }
+            for b in [1.0f32, 3.0] {
+                let i0 = ((t0 + b * beat) * srf) as usize;
+                for k in 0..(0.15 * srf) as usize {
+                    let x = k as f32 / srf;
+                    if i0 + k < n {
+                        out[i0 + k] += (nz.f() * 2.0 - 1.0) * (-x * 25.0).exp() * 0.4;
+                    }
+                }
+            }
+            for h in 0..8 {
+                let i0 = ((t0 + h as f32 * beat * 0.5) * srf) as usize;
+                for k in 0..(0.03 * srf) as usize {
+                    let x = k as f32 / srf;
+                    if i0 + k < n {
+                        out[i0 + k] += (nz.f() * 2.0 - 1.0) * (-x * 90.0).exp() * 0.08;
+                    }
+                }
+            }
+            bar += 1;
+        }
+        out
+    }
+
+    #[test]
+    fn tresillo_kicks_do_not_fool_tempo() {
+        for bpm in [96.0f32, 100.0, 105.0] {
+            let mono = three_three_two(bpm, 44_100);
+            let an = analyze(&mono, 44_100, &AtomicU32::new(0));
+            let r = an.bpm / bpm;
+            assert!((r - 1.0).abs() < 0.03 || (r - 2.0).abs() < 0.06, "{bpm} BPM 3+3+2 detected as {}", an.bpm);
+        }
+    }
+
+    #[test]
+    fn beat_times_are_unbiased() {
+        for sr in [44_100u32, 48_000] {
+            for (bpm, seed) in [(97.0f32, 11u64), (124.0, 12), (141.0, 13)] {
+                let (mono, _, _, _, beats) = busy_mix(bpm, sr, 30.0, seed);
+                let an = analyze(&mono, sr, &AtomicU32::new(0));
+                let e = signed_errors(&an.beats, &beats);
+                let (mean, p95) = err_stats(&e);
+                assert!(e.len() as f32 >= 0.9 * beats.len() as f32, "only {} of {} beats matched", e.len(), beats.len());
+                assert!(mean.abs() <= 0.005 && p95 <= 0.015, "sr {sr} bpm {bpm}: beat mean {:.1} ms p95 {:.1} ms", mean * 1e3, p95 * 1e3);
+                assert!(an.beat_conf > 0.7, "beat_conf {} on a steady groove", an.beat_conf);
+            }
+        }
+    }
+
+    /// Quiet intro, verse, loud chorus, breakdown, chorus, through a brick-wall limiter.
+    fn compressed_song(sr: u32) -> Vec<f32> {
+        let (mix, ..) = busy_mix(120.0, sr, 96.0, 21);
+        let srf = sr as f32;
+        let tau = std::f32::consts::TAU;
+        let mut nz = Lcg(77);
+        let mut out = vec![0.0f32; mix.len()];
+        for i in 0..mix.len() {
+            let t = i as f32 / srf;
+            let pad = ((tau * 220.0 * t).sin() + (tau * 330.0 * t).sin()) * 0.15;
+            // 0-16 intro (pad), 16-40 verse (groove), 40-64 chorus (groove + noise wash), 64-72 breakdown, 72-96 chorus
+            let (g, wash) = match t {
+                t if t < 16.0 => (0.0, 0.0),
+                t if t < 40.0 => (1.0, 0.0),
+                t if t < 64.0 => (1.0, 1.0),
+                t if t < 72.0 => (0.0, 0.0),
+                _ => (1.0, 1.0),
+            };
+            let x = pad + g * mix[i] + wash * ((nz.f() * 2.0 - 1.0) * 0.25 + mix[i] * 0.6);
+            out[i] = (x * 4.0).tanh() * 0.9;
+        }
+        out
+    }
+
+    #[test]
+    fn sections_follow_song_structure_on_compressed_master() {
+        let sr = 44_100;
+        let an = analyze(&compressed_song(sr), sr, &AtomicU32::new(0));
+        let kind_at = |t: f32| an.section_at(t).map(|s| s.kind).unwrap();
+        assert_eq!(kind_at(8.0), SectionKind::Calm, "{:?}", an.sections);
+        assert!(matches!(kind_at(52.0), SectionKind::Intense | SectionKind::Drop), "{:?}", an.sections);
+        assert!(matches!(kind_at(84.0), SectionKind::Intense | SectionKind::Drop), "{:?}", an.sections);
+        let hot: f32 = an.sections.iter().filter(|s| matches!(s.kind, SectionKind::Intense | SectionKind::Drop)).map(|s| s.t1 - s.t0).sum();
+        assert!(hot / an.duration < 0.6, "too much of the song is Intense: {:?}", an.sections);
+        let mean = an.intensity.iter().sum::<f32>() / an.intensity.len() as f32;
+        assert!((0.4..0.6).contains(&mean), "intensity mean {mean}");
+    }
+
+    #[test]
+    fn intensity_is_relative_to_the_song() {
+        // A sparse slow song and a dense fast one should both span the scale around 0.5.
+        let sr = 44_100;
+        let slow: Vec<f32> = busy_mix(72.0, sr, 40.0, 31).0.iter().map(|x| x * 0.15).collect();
+        let fast = compressed_song(sr);
+        for (name, mono) in [("slow", slow), ("fast", fast)] {
+            let an = analyze(&mono, sr, &AtomicU32::new(0));
+            let mean = an.intensity.iter().sum::<f32>() / an.intensity.len() as f32;
+            let hi = an.intensity.iter().filter(|&&v| v > 0.8).count() as f32 / an.intensity.len() as f32;
+            assert!((0.4..0.6).contains(&mean), "{name}: intensity mean {mean}");
+            assert!(hi > 0.1, "{name}: intensity never gets high");
+        }
+    }
+
+    #[test]
+    fn free_time_audio_has_low_beat_conf() {
+        // Slowly swelling, unaccented pad chords with no pulse.
+        let sr = 44_100;
+        let n = 40 * sr as usize;
+        let tau = std::f32::consts::TAU;
+        let mono: Vec<f32> = (0..n)
+            .map(|i| {
+                let t = i as f32 / sr as f32;
+                let env = 0.5 + 0.5 * (tau * t / 13.7).sin();
+                ((tau * 196.0 * t).sin() + (tau * 246.9 * t + (t * 0.31).sin()).sin() + (tau * 293.7 * t).sin()) * 0.1 * env
+            })
+            .collect();
+        let an = analyze(&mono, sr, &AtomicU32::new(0));
+        assert!(an.beat_conf < 0.3, "beat_conf {} on a pulseless pad", an.beat_conf);
+    }
+
+    #[test]
+    fn live_beat_locks_to_the_groove() {
+        for (bpm, seed) in [(124.0f32, 41u64), (97.0, 42)] {
+            let sr = 48_000;
+            let (mono, _, _, _, beats) = busy_mix(bpm, sr, 30.0, seed);
+            let mut sa = StreamAnalyzer::new(sr);
+            let mut out = StreamOut::default();
+            for chunk in mono.chunks(480) {
+                sa.push(chunk, &mut out);
+            }
+            let lb = sa.live_beat();
+            assert!(lb.conf > 0.3, "live conf {}", lb.conf);
+            let true_p = 60.0 / bpm;
+            let r = lb.period / true_p;
+            assert!((r - 1.0).abs() < 0.02 || (r - 0.5).abs() < 0.01 || (r - 2.0).abs() < 0.04, "live period {} vs {}", lb.period, true_p);
+            // Predicted beats near the end must sit on true beats (or true 8ths when double-time).
+            let grid = if r < 0.75 { true_p * 0.5 } else { true_p };
+            for k in -6..0 {
+                let t = lb.phase_t + k as f32 * lb.period;
+                let off = ((t - beats[0]) / grid).round() * grid + beats[0];
+                assert!((t - off).abs() < 0.02, "live beat {:.3} is {:.0} ms off", t, (t - off) * 1e3);
+            }
+        }
     }
 
     #[test]
@@ -913,10 +1605,244 @@ pub struct StreamAnalyzer {
     norm: [f32; 4],
     spec_ref: f32,
     rms_hist: VecDeque<f32>,
+    live: LiveTempo,
 }
 
 const LOOKAHEAD: usize = 3;
 const HIST: usize = 48;
+
+/// Online beat estimate for live mode: beats are predicted at `phase_t + k * period` (seconds on the
+/// capture timeline). `conf` is 0 when there is no usable pulse yet.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct LiveBeat {
+    pub period: f32,
+    pub phase_t: f32,
+    pub conf: f32,
+}
+
+/// Onset-envelope history for the live tempo tracker (~11 s at 48 kHz). Allocated once.
+const LIVE_HIST: usize = 1024;
+/// Re-estimate the live tempo every this many analysis frames (~0.2 s).
+const LIVE_EVERY: u64 = 20;
+
+struct LiveTempo {
+    env: Vec<f32>,
+    pos: usize,
+    filled: usize,
+    refs: [f32; 3],
+    ac: Vec<f32>,
+    lin: Vec<f32>,
+    pre: Vec<f32>,
+    beat: LiveBeat,
+    /// Candidate period (frames) waiting to replace the current one, and how often it has won.
+    pending: (f32, u32),
+    period_f: f32,
+}
+
+impl LiveTempo {
+    fn new() -> Self {
+        LiveTempo {
+            env: vec![0.0; LIVE_HIST],
+            pos: 0,
+            filled: 0,
+            refs: [1e-3; 3],
+            ac: vec![0.0; LIVE_HIST / 2],
+            lin: vec![0.0; LIVE_HIST],
+            pre: vec![0.0; LIVE_HIST + 1],
+            beat: LiveBeat::default(),
+            pending: (0.0, 0),
+            period_f: 0.0,
+        }
+    }
+
+    fn push(&mut self, flux: &[f32; 3]) {
+        let w = [1.5f32, 1.0, 0.5];
+        let mut e = 0.0;
+        for b in 0..3 {
+            self.refs[b] = (self.refs[b] * 0.9995).max(flux[b]).max(1e-3);
+            e += w[b] * (flux[b] / (0.6 * self.refs[b])).min(2.0);
+        }
+        self.env[self.pos] = e;
+        self.pos = (self.pos + 1) % LIVE_HIST;
+        self.filled = (self.filled + 1).min(LIVE_HIST);
+    }
+
+    /// `last_t`: capture time of the newest envelope frame.
+    fn update(&mut self, hop_dt: f32, last_t: f32) {
+        let n = self.filled;
+        let lo = ((60.0 / MAX_BPM) / hop_dt).floor() as usize;
+        let hi = ((60.0 / MIN_BPM) / hop_dt).ceil() as usize;
+        if lo < 2 || 2 * hi + 2 >= self.ac.len() || n < (4 * hi).min(LIVE_HIST) {
+            self.beat.conf = 0.0;
+            return;
+        }
+        // Linearise (oldest first), z-score, keep the positive part.
+        let start = (self.pos + LIVE_HIST - n) % LIVE_HIST;
+        for i in 0..n {
+            self.lin[i] = self.env[(start + i) % LIVE_HIST];
+        }
+        // Remove the local (+-0.5 s) mean like the offline envelope, then z-score.
+        let half = ((0.5 / hop_dt) as usize).max(2);
+        self.pre[0] = 0.0;
+        for i in 0..n {
+            self.pre[i + 1] = self.pre[i] + self.lin[i];
+        }
+        for i in 0..n {
+            let a = i.saturating_sub(half);
+            let z = (i + half + 1).min(n);
+            let local = (self.pre[z] - self.pre[a]) / (z - a) as f32;
+            self.lin[i] = (self.lin[i] - local).max(0.0);
+        }
+        let o = &mut self.lin[..n];
+        let (m, sd) = mean_std(o);
+        if sd < 1e-6 {
+            self.beat.conf = 0.0;
+            return;
+        }
+        for v in o.iter_mut() {
+            *v = ((*v - m) / sd).max(0.0);
+        }
+        let o = &self.lin[..n];
+        let max_lag = 2 * hi + 2;
+        for lag in 1..=max_lag {
+            let mut acc = 0.0f32;
+            for i in 0..n - lag {
+                acc += o[i] * o[i + lag];
+            }
+            self.ac[lag] = acc / (n - lag) as f32;
+        }
+        let a0 = o.iter().map(|v| v * v).sum::<f32>() / n as f32;
+        let ac = &self.ac;
+        let score = |lag: usize| -> f32 {
+            let bpm = 60.0 / (lag as f32 * hop_dt);
+            (ac[lag] + 0.5 * ac[2 * lag] + 0.15 * (ac[2 * lag - 1] + ac[2 * lag + 1])) * tempo_prior(bpm, 0.85)
+        };
+        let mut best = lo;
+        let mut best_s = f32::MIN;
+        for lag in lo..=hi {
+            let sc = score(lag);
+            if sc > best_s {
+                best_s = sc;
+                best = lag;
+            }
+        }
+        let mut p = best as f32;
+        if best > lo && best < hi {
+            let (a, b, c) = (score(best - 1), score(best), score(best + 1));
+            let d = a - 2.0 * b + c;
+            if d.abs() > 1e-9 {
+                p += (0.5 * (a - c) / d).clamp(-0.5, 0.5);
+            }
+        }
+        // Same metrical-level check as offline: a grid with ternary subdivisions and weak beats is
+        // usually 4:3 or 3:2 off.
+        let comb_p = |ph: f32, pf: f32| -> f32 {
+            let mut v = 0.0;
+            let mut k = 0.0f32;
+            loop {
+                let idx = n as isize - 1 - (ph + k * pf).round() as isize;
+                if idx < 0 {
+                    break;
+                }
+                if (idx as usize) < n {
+                    v += o[idx as usize] * (-k / 12.0).exp();
+                }
+                k += 1.0;
+            }
+            v
+        };
+        let level_score = |pf: f32| -> f32 {
+            let steps = (pf.round() as usize).max(2);
+            let mut bp = 0usize;
+            let mut bv = f32::MIN;
+            for ph in 0..steps {
+                let v = comb_p(ph as f32, pf);
+                if v > bv {
+                    bv = v;
+                    bp = ph;
+                }
+            }
+            let ph = bp as f32;
+            let sal = [
+                bv,
+                comb_p(ph + 0.5 * pf, pf),
+                0.5 * (comb_p(ph + 0.25 * pf, pf) + comb_p(ph + 0.75 * pf, pf)),
+                0.5 * (comb_p(ph + pf / 3.0, pf) + comb_p(ph + 2.0 * pf / 3.0, pf)),
+            ];
+            metrical_score(&sal) * tempo_prior(60.0 / (pf * hop_dt), 1.2)
+        };
+        let base_s = level_score(p) * TEMPO_SWITCH_MARGIN;
+        let mut best_level = (p, base_s);
+        for r in [4.0f32 / 3.0, 0.75, 2.0 / 3.0, 1.5] {
+            let c = p * r;
+            let bpm = 60.0 / (c * hop_dt);
+            if !(MIN_BPM..=MAX_BPM).contains(&bpm) || 2.0 * c > (n as f32) / 2.0 {
+                continue;
+            }
+            let sc = level_score(c);
+            if sc > best_level.1 {
+                best_level = (c, sc);
+            }
+        }
+        let mut p = best_level.0;
+        if 60.0 / (p * hop_dt) < MIN_PLAY_BPM {
+            p *= 0.5;
+        }
+        // Hysteresis: keep the current period unless a different one wins several updates in a row.
+        if self.period_f <= 0.0 {
+            self.period_f = p;
+        } else if (p / self.period_f - 1.0).abs() < 0.04 {
+            self.period_f += 0.25 * (p - self.period_f);
+            self.pending = (0.0, 0);
+        } else if (p / self.pending.0.max(1e-3) - 1.0).abs() < 0.04 {
+            self.pending.1 += 1;
+            if self.pending.1 >= 5 {
+                self.period_f = p;
+                self.pending = (0.0, 0);
+                self.beat.conf = 0.0;
+            }
+        } else {
+            self.pending = (p, 1);
+        }
+        let pf = self.period_f;
+        // Phase: offset (frames back from the newest frame) whose comb of past beats is strongest,
+        // with recent beats weighted more.
+        let comb = |ph: f32| comb_p(ph, pf);
+        let steps = (pf.round() as usize).max(2);
+        let mut best_ph = 0usize;
+        let mut best_v = f32::MIN;
+        for ph in 0..steps {
+            let v = comb(ph as f32);
+            if v > best_v {
+                best_v = v;
+                best_ph = ph;
+            }
+        }
+        let (a, b, c) = (comb(best_ph as f32 - 1.0), best_v, comb(best_ph as f32 + 1.0));
+        let d = a - 2.0 * b + c;
+        let mut off = best_ph as f32;
+        if best_ph > 0 && d.abs() > 1e-9 {
+            off -= (0.5 * (a - c) / d).clamp(-0.5, 0.5);
+        }
+        let period = pf * hop_dt;
+        let new_phase = last_t - off * hop_dt + ONSET_BIAS_S;
+        // Smooth the phase against the previous prediction so beats do not jump.
+        let phase_t = if self.beat.conf > 0.0 && self.beat.period > 0.0 {
+            let k = ((new_phase - self.beat.phase_t) / period).round();
+            let pred = self.beat.phase_t + k * period;
+            let mut err = new_phase - pred;
+            if err.abs() > 0.25 * period {
+                err *= 0.3;
+            }
+            pred + 0.35 * err
+        } else {
+            new_phase
+        };
+        let per = if a0 > 1e-9 { (ac[best].max(ac[2 * best]) / a0).clamp(0.0, 1.0) } else { 0.0 };
+        let conf = ((per - LIVE_CONF_LO) / (LIVE_CONF_HI - LIVE_CONF_LO)).clamp(0.0, 1.0).max(0.01);
+        self.beat = LiveBeat { period, phase_t, conf };
+    }
+}
 
 impl StreamAnalyzer {
     pub fn new(sr: u32) -> Self {
@@ -931,11 +1857,17 @@ impl StreamAnalyzer {
             norm: [0.02, 0.02, 0.01, 0.05],
             spec_ref: 2.0,
             rms_hist: VecDeque::new(),
+            live: LiveTempo::new(),
         }
     }
 
     pub fn hop_dt(&self) -> f32 {
         self.sp.hop_dt()
+    }
+
+    /// Current online beat estimate (cheap: returns the state updated inside `push`).
+    pub fn live_beat(&self) -> LiveBeat {
+        self.live.beat
     }
 
     /// Feed mono samples (continuous capture timeline starting at t = 0).
@@ -976,6 +1908,10 @@ impl StreamAnalyzer {
                 raw.rms,
             ));
 
+            self.live.push(&raw.flux);
+            if self.frame % LIVE_EVERY == 0 {
+                self.live.update(hop_dt, t);
+            }
             self.rms_hist.push_back(raw.rms);
             if self.rms_hist.len() > HIST {
                 self.rms_hist.pop_front();
@@ -984,7 +1920,7 @@ impl StreamAnalyzer {
             let bands = [Band::Low, Band::Mid, Band::High];
             for b in 0..3 {
                 let env = &mut self.env[b];
-                env.push_back(raw.flux[b]);
+                env.push_back(if b == 0 { raw.kick } else { raw.flux[b] });
                 if env.len() > HIST {
                     env.pop_front();
                 }
