@@ -37,9 +37,21 @@ struct FileState {
     gain_step: f32,
     /// Stop (drop the track) once a fade-out reaches silence.
     stop_at_zero: bool,
-    /// The previous track, fading out underneath the new one (crossfade).
-    prev: Option<(Arc<Track>, f64, f32, f32)>,
+    /// Previous tracks fading out underneath the current one (crossfade): (track, pos, gain,
+    /// gain step). Capacity `MAX_PREV`, so pushing never allocates in steady state.
+    prevs: Vec<(Arc<Track>, f64, f32, f32)>,
+    /// Tracks the audio callback is done with. Dropping the last `Arc` of a decoded song frees
+    /// ~100 MB, which must never happen on the audio thread, so the callback parks them here and
+    /// the main thread frees them (`Audio::reap`).
+    graveyard: Vec<Arc<Track>>,
 }
+
+/// Crossfade voices kept at once; extra (oldest) ones are cut when a new fade starts.
+const MAX_PREV: usize = 4;
+/// Graveyard capacity reserved up front so the callback's push doesn't allocate.
+const GRAVE_CAP: usize = 8;
+/// Fade (seconds) applied either side of a loop wrap so looping music doesn't click.
+const LOOP_XF_SECS: f64 = 0.03;
 
 /// One playing sound effect.
 struct SfxVoice {
@@ -238,7 +250,8 @@ impl Audio {
                 gain_target: 1.0,
                 gain_step: 1.0,
                 stop_at_zero: false,
-                prev: None,
+                prevs: Vec::with_capacity(MAX_PREV),
+                graveyard: Vec::with_capacity(GRAVE_CAP),
             }),
             live: Mutex::new(LiveState {
                 running: false,
@@ -380,13 +393,28 @@ impl Audio {
     /// Start a track. With `fade > 0` it fades in over that many seconds while whatever was
     /// playing fades out underneath it (crossfade). `looping` wraps around at the end.
     pub fn play_ex(&self, track: Arc<Track>, from_secs: f64, looping: bool, fade: f32) {
+        self.reap();
+        // Tracks released here are dropped after the lock is released, never under it.
+        let mut released: Vec<Arc<Track>> = Vec::new();
         {
             let mut st = self.shared.file.lock().unwrap();
             let step = if fade > 0.01 { 1.0 / (fade * 48_000.0) } else { 1.0 };
-            st.prev = match (st.track.take(), st.playing && fade > 0.01) {
-                (Some(old), true) => Some((old, st.pos, st.gain, step)),
-                _ => None,
-            };
+            let crossfade = st.playing && fade > 0.01;
+            if !crossfade {
+                released.extend(st.prevs.drain(..).map(|p| p.0));
+            }
+            if let Some(old) = st.track.take() {
+                if crossfade {
+                    // Keep earlier fades going (no cut-off click); only the oldest goes if full.
+                    if st.prevs.len() >= MAX_PREV {
+                        released.push(st.prevs.remove(0).0);
+                    }
+                    let (pos, gain) = (st.pos, st.gain);
+                    st.prevs.push((old, pos, gain, step));
+                } else {
+                    released.push(old);
+                }
+            }
             st.pos = from_secs.max(0.0) * track.sr as f64;
             st.stamp_pos = st.pos;
             st.stamp = Instant::now();
@@ -400,10 +428,25 @@ impl Audio {
             st.gain_step = step;
             st.stop_at_zero = false;
         }
+        drop(released);
         let _ = self.tx.send(Cmd::EnsureFile);
+    }
+    /// Free tracks the audio callback has finished with (see `FileState::graveyard`). Swaps in
+    /// a fresh, pre-sized graveyard under the lock and drops the old one outside it.
+    fn reap(&self) {
+        let has_dead = !self.shared.file.lock().unwrap_or_else(|e| e.into_inner()).graveyard.is_empty();
+        if has_dead {
+            let mut dead = Vec::with_capacity(GRAVE_CAP);
+            {
+                let mut st = self.shared.file.lock().unwrap_or_else(|e| e.into_inner());
+                std::mem::swap(&mut st.graveyard, &mut dead);
+            }
+            drop(dead);
+        }
     }
     /// Fade the current track out over `secs` and then stop it.
     pub fn fade_out(&self, secs: f32) {
+        self.reap();
         let mut st = self.shared.file.lock().unwrap();
         st.gain_target = 0.0;
         st.gain_step = 1.0 / (secs.max(0.02) * 48_000.0);
@@ -411,6 +454,7 @@ impl Audio {
     }
     /// Is a track loaded (playing or paused)?
     pub fn has_track(&self) -> bool {
+        self.reap();
         self.shared.file.lock().unwrap().track.is_some()
     }
     pub fn set_paused(&self, paused: bool) {
@@ -421,14 +465,20 @@ impl Audio {
         st.stamp = Instant::now();
     }
     pub fn stop(&self) {
-        let mut st = self.shared.file.lock().unwrap();
-        st.playing = false;
-        st.track = None;
-        st.prev = None;
-        st.finished = false;
+        self.reap();
+        let released: Vec<Arc<Track>> = {
+            let mut st = self.shared.file.lock().unwrap();
+            st.playing = false;
+            st.finished = false;
+            let mut r: Vec<Arc<Track>> = st.prevs.drain(..).map(|p| p.0).collect();
+            r.extend(st.track.take());
+            r
+        };
+        drop(released);
     }
     /// Position (seconds) of the audio that is audible right now.
     pub fn song_time(&self) -> f64 {
+        self.reap();
         let st = self.shared.file.lock().unwrap();
         let Some(tr) = &st.track else { return 0.0 };
         let sr = tr.sr as f64;
@@ -594,23 +644,38 @@ where
             };
             // Fades are specified against 48 kHz; correct for the real device rate.
             let rate_k = (48_000.0 / out_sr) as f32;
-            // Previous track fading out underneath (crossfade).
-            if let Some((tr, mut pos, mut gain, gstep)) = st.prev.take() {
-                let step = tr.sr as f64 / out_sr;
-                let total = tr.frames();
-                for f in 0..frames {
-                    if gain <= 0.0 || pos as usize + 1 >= total {
-                        gain = 0.0;
-                        break;
+            // Previous tracks fading out underneath (crossfade). Frozen while paused.
+            // Finished ones go to the graveyard; the main thread frees them (never free here).
+            let mut i = 0;
+            while st.playing && i < st.prevs.len() {
+                let (pos, gain) = {
+                    // Arc clone is just a refcount bump; `prevs` keeps the owning reference.
+                    let (tr, mut pos, mut gain, gstep) = {
+                        let p = &st.prevs[i];
+                        (p.0.clone(), p.1, p.2, p.3)
+                    };
+                    let step = tr.sr as f64 / out_sr;
+                    let total = tr.frames();
+                    for f in 0..frames {
+                        if gain <= 0.0 || pos as usize + 1 >= total {
+                            gain = 0.0;
+                            break;
+                        }
+                        let (l, r) = sample(&tr, pos);
+                        mix[2 * f] += l * gain * vol;
+                        mix[2 * f + 1] += r * gain * vol;
+                        pos += step;
+                        gain -= gstep * rate_k;
                     }
-                    let (l, r) = sample(&tr, pos);
-                    mix[2 * f] += l * gain * vol;
-                    mix[2 * f + 1] += r * gain * vol;
-                    pos += step;
-                    gain -= gstep * rate_k;
-                }
+                    (pos, gain)
+                };
                 if gain > 0.0 {
-                    st.prev = Some((tr, pos, gain, gstep));
+                    st.prevs[i].1 = pos;
+                    st.prevs[i].2 = gain;
+                    i += 1;
+                } else {
+                    let done = st.prevs.swap_remove(i).0;
+                    st.graveyard.push(done);
                 }
             }
             let track = if st.playing { st.track.clone() } else { None };
@@ -621,13 +686,22 @@ where
                 let mut pos = st.pos;
                 let mut gain = st.gain;
                 let (target, gstep) = (st.gain_target, st.gain_step * rate_k);
+                let looping = st.looping;
+                let xf = LOOP_XF_SECS * tr.sr as f64;
+                let last = total.saturating_sub(1) as f64;
                 for f in 0..frames {
-                    if st.looping && pos as usize + 1 >= total && total > 2 {
-                        pos -= (total - 1) as f64;
+                    if looping && pos as usize + 1 >= total && total > 2 {
+                        pos -= last;
                     }
+                    // Looping: dip to silence across the wrap (end and restart) instead of a click.
+                    let env = if looping && total as f64 > 4.0 * xf {
+                        (((last - pos) / xf).min(pos / xf)).clamp(0.0, 1.0) as f32
+                    } else {
+                        1.0
+                    };
                     let (l, r) = sample(&tr, pos);
-                    mix[2 * f] += l * gain * vol;
-                    mix[2 * f + 1] += r * gain * vol;
+                    mix[2 * f] += l * gain * env * vol;
+                    mix[2 * f + 1] += r * gain * env * vol;
                     pos += step;
                     if gain < target {
                         gain = (gain + gstep).min(target);
@@ -642,8 +716,10 @@ where
                 }
                 if st.stop_at_zero && gain <= 0.0 {
                     st.playing = false;
-                    st.track = None;
                     st.stop_at_zero = false;
+                    if let Some(done) = st.track.take() {
+                        st.graveyard.push(done);
+                    }
                 }
             }
             drop(st);
