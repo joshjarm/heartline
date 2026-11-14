@@ -1,0 +1,6 @@
+/target
+/tmp
+/#UserTesting
+/references
+heartline-crash.log
+*.pdb
