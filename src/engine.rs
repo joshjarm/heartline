@@ -29,6 +29,144 @@ struct FileState {
     stamp: Instant,
     stamp_pos: f64,
     latency: f64,
+    /// Wrap around at the end instead of finishing (menu music).
+    looping: bool,
+    /// Current / target gain of the main voice and how fast it moves (per output frame).
+    gain: f32,
+    gain_target: f32,
+    gain_step: f32,
+    /// Stop (drop the track) once a fade-out reaches silence.
+    stop_at_zero: bool,
+    /// The previous track, fading out underneath the new one (crossfade).
+    prev: Option<(Arc<Track>, f64, f32, f32)>,
+}
+
+/// One playing sound effect.
+struct SfxVoice {
+    buf: Arc<Vec<f32>>,
+    pos: f64,
+    gain: f32,
+    pan: f32,
+}
+
+/// Sample rate the sound-effect bank is synthesised at.
+const SFX_SR: f64 = 48_000.0;
+const MAX_SFX_VOICES: usize = 14;
+
+/// Sound effects. All are short, soft and unpitched or neutrally pitched so they sit under any
+/// song; the ones tied to the beat (tile slams, the Heart) land on musical moments anyway.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Sfx {
+    Hurt = 0,
+    Shard,
+    Upgrade,
+    Kill,
+    HeartBreak,
+    Slam,
+    Dash,
+    Shield,
+    Death,
+    UiMove,
+    UiSelect,
+    Heal,
+    NoteShot,
+    Clear,
+}
+
+const SFX_COUNT: usize = 14;
+
+fn build_sfx_bank() -> Vec<Arc<Vec<f32>>> {
+    let sr = SFX_SR as f32;
+    let tau = std::f32::consts::TAU;
+    let mut seed = 0x2468_ACE1u32;
+    let mut noise = move || {
+        seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+        (seed >> 8) as f32 / (1u32 << 24) as f32 * 2.0 - 1.0
+    };
+    // Render `secs` of sound from a per-sample closure, with a short fade at both ends.
+    let mut make = |secs: f32, f: &mut dyn FnMut(f32, f32) -> f32| -> Arc<Vec<f32>> {
+        let n = (secs * sr) as usize;
+        let mut v = Vec::with_capacity(n);
+        for i in 0..n {
+            let t = i as f32 / sr;
+            let edge = (t * 400.0).min(1.0) * ((secs - t) * 200.0).clamp(0.0, 1.0);
+            v.push(f(t, noise()) * edge);
+        }
+        Arc::new(v)
+    };
+    let mut bank: Vec<Arc<Vec<f32>>> = Vec::with_capacity(SFX_COUNT);
+    // Hurt: low thud plus a short dull noise burst.
+    let mut lp = 0.0f32;
+    bank.push(make(0.28, &mut |t, n| {
+        lp += (n - lp) * 0.12;
+        (tau * (58.0 + 70.0 * (-t * 22.0).exp()) * t).sin() * (-t * 13.0).exp() * 0.8 + lp * (-t * 26.0).exp() * 0.9
+    }));
+    // Shard: tiny soft tick with a hint of tone.
+    bank.push(make(0.05, &mut |t, _| (tau * 1560.0 * t).sin() * (-t * 90.0).exp() * 0.35));
+    // Upgrade: two soft rising notes (a fifth apart).
+    bank.push(make(0.5, &mut |t, _| {
+        let a = (tau * 660.0 * t).sin() * (-t * 9.0).exp();
+        let t2 = (t - 0.11).max(0.0);
+        let b = if t > 0.11 { ((tau * 990.0 * t2).sin() + 0.3 * (tau * 1980.0 * t2).sin()) * (-t2 * 7.0).exp() } else { 0.0 };
+        (a + b) * 0.4
+    }));
+    // Kill: short filtered pop falling in pitch.
+    let mut lp = 0.0f32;
+    bank.push(make(0.12, &mut |t, n| {
+        lp += (n - lp) * 0.3;
+        (tau * (420.0 * (-t * 30.0).exp() + 120.0) * t).sin() * (-t * 34.0).exp() * 0.5 + lp * (-t * 60.0).exp() * 0.4
+    }));
+    // Heart break: sub boom, noise wash and a glassy shimmer.
+    let mut lp = 0.0f32;
+    bank.push(make(1.6, &mut |t, n| {
+        lp += (n - lp) * 0.06;
+        let boom = (tau * (40.0 + 60.0 * (-t * 8.0).exp()) * t).sin() * (-t * 3.2).exp();
+        let shimmer = ((tau * 1320.0 * t).sin() + (tau * 1977.0 * t).sin() + (tau * 2640.0 * t).sin()) * (-t * 2.6).exp() * 0.12;
+        boom * 0.9 + lp * (-t * 5.0).exp() * 1.2 + shimmer
+    }));
+    // Slam: tight low thump (tile strikes; always lands on a beat).
+    bank.push(make(0.2, &mut |t, _| (tau * (48.0 + 90.0 * (-t * 40.0).exp()) * t).sin() * (-t * 20.0).exp() * 0.9));
+    // Dash: airy sweep.
+    let (mut lp, mut lp2) = (0.0f32, 0.0f32);
+    bank.push(make(0.18, &mut |t, n| {
+        let k = 0.08 + 0.5 * (t / 0.18);
+        lp += (n - lp) * k;
+        lp2 += (lp - lp2) * 0.5;
+        (lp - lp2 * 0.6) * (t * 40.0).min(1.0) * (-t * 14.0).exp() * 0.9
+    }));
+    // Shield: glassy ping.
+    bank.push(make(0.4, &mut |t, _| ((tau * 1244.0 * t).sin() + 0.5 * (tau * 1866.0 * t).sin()) * (-t * 9.0).exp() * 0.35));
+    // Death: falling tone into a thud.
+    let mut lp = 0.0f32;
+    bank.push(make(1.1, &mut |t, n| {
+        lp += (n - lp) * 0.05;
+        let f = 300.0 * (-t * 2.4).exp() + 38.0;
+        (tau * f * t).sin() * (-t * 2.4).exp() * 0.7 + lp * (-t * 4.0).exp() * 0.8
+    }));
+    // UI move / select.
+    bank.push(make(0.035, &mut |t, _| (tau * 880.0 * t).sin() * (-t * 110.0).exp() * 0.3));
+    bank.push(make(0.16, &mut |t, _| ((tau * 660.0 * t).sin() + 0.5 * (tau * 1320.0 * t).sin()) * (-t * 22.0).exp() * 0.35));
+    // Heal: soft warm double blip.
+    bank.push(make(0.3, &mut |t, _| {
+        let t2 = (t - 0.08).max(0.0);
+        ((tau * 523.0 * t).sin() * (-t * 16.0).exp() + if t > 0.08 { (tau * 784.0 * t2).sin() * (-t2 * 12.0).exp() } else { 0.0 }) * 0.35
+    }));
+    // Note shot down: very short dry click.
+    bank.push(make(0.03, &mut |t, n| (n * 0.3 + (tau * 2200.0 * t).sin() * 0.3) * (-t * 160.0).exp() * 0.4));
+    // Track clear: gentle rising three-note figure.
+    bank.push(make(0.9, &mut |t, _| {
+        let mut s = 0.0;
+        for (k, f) in [523.25f32, 659.25, 783.99].iter().enumerate() {
+            let t0 = k as f32 * 0.12;
+            if t > t0 {
+                let x = t - t0;
+                s += ((tau * f * x).sin() + 0.25 * (tau * 2.0 * f * x).sin()) * (-x * 5.0).exp();
+            }
+        }
+        s * 0.3
+    }));
+    debug_assert_eq!(bank.len(), SFX_COUNT);
+    bank
 }
 
 struct LiveState {
@@ -52,6 +190,8 @@ struct Shared {
     file: Mutex<FileState>,
     live: Mutex<LiveState>,
     volume: AtomicU32,
+    sfx_volume: AtomicU32,
+    sfx: Mutex<Vec<SfxVoice>>,
     devices: Mutex<Vec<DevInfo>>,
     status: Mutex<String>,
 }
@@ -77,6 +217,7 @@ pub struct LiveInfo {
 pub struct Audio {
     shared: Arc<Shared>,
     tx: Sender<Cmd>,
+    bank: Vec<Arc<Vec<f32>>>,
 }
 
 impl Audio {
@@ -92,6 +233,12 @@ impl Audio {
                 stamp: now,
                 stamp_pos: 0.0,
                 latency: 0.03,
+                looping: false,
+                gain: 1.0,
+                gain_target: 1.0,
+                gain_step: 1.0,
+                stop_at_zero: false,
+                prev: None,
             }),
             live: Mutex::new(LiveState {
                 running: false,
@@ -110,6 +257,8 @@ impl Audio {
                 last_write: now,
             }),
             volume: AtomicU32::new(0.8f32.to_bits()),
+            sfx_volume: AtomicU32::new(0.5f32.to_bits()),
+            sfx: Mutex::new(Vec::with_capacity(MAX_SFX_VOICES)),
             devices: Mutex::new(Vec::new()),
             status: Mutex::new(String::new()),
         });
@@ -190,7 +339,24 @@ impl Audio {
                 drop((file_stream, cap_stream, live_out));
             })
             .expect("audio thread");
-        Audio { shared, tx }
+        Audio { shared, tx, bank: build_sfx_bank() }
+    }
+
+    // ---- sound effects ----
+    pub fn set_sfx_volume(&self, v: f32) {
+        self.shared.sfx_volume.store(v.clamp(0.0, 1.5).to_bits(), Ordering::Relaxed);
+    }
+    /// Make sure the output stream exists (so effects can play before any music has).
+    pub fn ensure_output(&self) {
+        let _ = self.tx.send(Cmd::EnsureFile);
+    }
+    /// Play a sound effect. `gain` 0..1, `pan` -1 (left) .. 1 (right).
+    pub fn sfx(&self, s: Sfx, gain: f32, pan: f32) {
+        let Some(buf) = self.bank.get(s as usize) else { return };
+        let mut v = self.shared.sfx.lock().unwrap_or_else(|e| e.into_inner());
+        if v.len() < MAX_SFX_VOICES {
+            v.push(SfxVoice { buf: buf.clone(), pos: 0.0, gain: gain.clamp(0.0, 1.5), pan: pan.clamp(-1.0, 1.0) });
+        }
     }
 
     // ---- common ----
@@ -209,17 +375,43 @@ impl Audio {
 
     // ---- file playback ----
     pub fn play(&self, track: Arc<Track>, from_secs: f64) {
+        self.play_ex(track, from_secs, false, 0.0);
+    }
+    /// Start a track. With `fade > 0` it fades in over that many seconds while whatever was
+    /// playing fades out underneath it (crossfade). `looping` wraps around at the end.
+    pub fn play_ex(&self, track: Arc<Track>, from_secs: f64, looping: bool, fade: f32) {
         {
             let mut st = self.shared.file.lock().unwrap();
-            st.pos = from_secs * track.sr as f64;
+            let step = if fade > 0.01 { 1.0 / (fade * 48_000.0) } else { 1.0 };
+            st.prev = match (st.track.take(), st.playing && fade > 0.01) {
+                (Some(old), true) => Some((old, st.pos, st.gain, step)),
+                _ => None,
+            };
+            st.pos = from_secs.max(0.0) * track.sr as f64;
             st.stamp_pos = st.pos;
             st.stamp = Instant::now();
             st.track = Some(track);
             st.playing = true;
             st.started = false;
             st.finished = false;
+            st.looping = looping;
+            st.gain = if fade > 0.01 { 0.0 } else { 1.0 };
+            st.gain_target = 1.0;
+            st.gain_step = step;
+            st.stop_at_zero = false;
         }
         let _ = self.tx.send(Cmd::EnsureFile);
+    }
+    /// Fade the current track out over `secs` and then stop it.
+    pub fn fade_out(&self, secs: f32) {
+        let mut st = self.shared.file.lock().unwrap();
+        st.gain_target = 0.0;
+        st.gain_step = 1.0 / (secs.max(0.02) * 48_000.0);
+        st.stop_at_zero = true;
+    }
+    /// Is a track loaded (playing or paused)?
+    pub fn has_track(&self) -> bool {
+        self.shared.file.lock().unwrap().track.is_some()
     }
     pub fn set_paused(&self, paused: bool) {
         let mut st = self.shared.file.lock().unwrap();
@@ -232,6 +424,7 @@ impl Audio {
         let mut st = self.shared.file.lock().unwrap();
         st.playing = false;
         st.track = None;
+        st.prev = None;
         st.finished = false;
     }
     /// Position (seconds) of the audio that is audible right now.
@@ -369,48 +562,119 @@ where
     let ch = config.channels as usize;
     let out_sr = config.sample_rate as f64;
     let sh_err = sh.clone();
+    // Scratch mix buffer (stereo), sized generously up front so the callback rarely grows it.
+    let mut mix: Vec<f32> = vec![0.0; 2 * 8192];
     dev.build_output_stream(
         config,
         move |data: &mut [T], info: &cpal::OutputCallbackInfo| {
             let vol = f32::from_bits(sh.volume.load(Ordering::Relaxed));
             let lat = latency_of(info);
-            let mut st = sh.file.lock().unwrap();
+            let mut st = sh.file.lock().unwrap_or_else(|e| e.into_inner());
             st.stamp = Instant::now();
             st.stamp_pos = st.pos;
             st.latency = lat;
             let frames = data.len() / ch.max(1);
-            let track = if st.playing { st.track.clone() } else { None };
-            match track {
-                Some(tr) => {
-                    st.started = true;
-                    let step = tr.sr as f64 / out_sr;
-                    let total = tr.frames();
+            if mix.len() < frames * 2 {
+                mix.resize(frames * 2, 0.0);
+            }
+            let mix = &mut mix[..frames * 2];
+            for v in mix.iter_mut() {
+                *v = 0.0;
+            }
+            let sample = |tr: &Track, pos: f64| -> (f32, f32) {
+                let total = tr.frames();
+                let i = pos as usize;
+                if i + 1 < total {
                     let s = &tr.samples;
-                    let mut pos = st.pos;
+                    let fr = (pos - i as f64) as f32;
+                    (s[2 * i] + (s[2 * i + 2] - s[2 * i]) * fr, s[2 * i + 1] + (s[2 * i + 3] - s[2 * i + 1]) * fr)
+                } else {
+                    (0.0, 0.0)
+                }
+            };
+            // Fades are specified against 48 kHz; correct for the real device rate.
+            let rate_k = (48_000.0 / out_sr) as f32;
+            // Previous track fading out underneath (crossfade).
+            if let Some((tr, mut pos, mut gain, gstep)) = st.prev.take() {
+                let step = tr.sr as f64 / out_sr;
+                let total = tr.frames();
+                for f in 0..frames {
+                    if gain <= 0.0 || pos as usize + 1 >= total {
+                        gain = 0.0;
+                        break;
+                    }
+                    let (l, r) = sample(&tr, pos);
+                    mix[2 * f] += l * gain * vol;
+                    mix[2 * f + 1] += r * gain * vol;
+                    pos += step;
+                    gain -= gstep * rate_k;
+                }
+                if gain > 0.0 {
+                    st.prev = Some((tr, pos, gain, gstep));
+                }
+            }
+            let track = if st.playing { st.track.clone() } else { None };
+            if let Some(tr) = track {
+                st.started = true;
+                let step = tr.sr as f64 / out_sr;
+                let total = tr.frames();
+                let mut pos = st.pos;
+                let mut gain = st.gain;
+                let (target, gstep) = (st.gain_target, st.gain_step * rate_k);
+                for f in 0..frames {
+                    if st.looping && pos as usize + 1 >= total && total > 2 {
+                        pos -= (total - 1) as f64;
+                    }
+                    let (l, r) = sample(&tr, pos);
+                    mix[2 * f] += l * gain * vol;
+                    mix[2 * f + 1] += r * gain * vol;
+                    pos += step;
+                    if gain < target {
+                        gain = (gain + gstep).min(target);
+                    } else if gain > target {
+                        gain = (gain - gstep).max(target);
+                    }
+                }
+                st.pos = pos;
+                st.gain = gain;
+                if !st.looping && pos as usize >= total {
+                    st.finished = true;
+                }
+                if st.stop_at_zero && gain <= 0.0 {
+                    st.playing = false;
+                    st.track = None;
+                    st.stop_at_zero = false;
+                }
+            }
+            drop(st);
+            // Sound effects on top.
+            let svol = f32::from_bits(sh.sfx_volume.load(Ordering::Relaxed));
+            {
+                let mut voices = sh.sfx.lock().unwrap_or_else(|e| e.into_inner());
+                let step = SFX_SR / out_sr;
+                for v in voices.iter_mut() {
+                    let (gl, gr) = (v.gain * svol * (1.0 - v.pan.max(0.0) * 0.6), v.gain * svol * (1.0 + v.pan.min(0.0) * 0.6));
+                    let n = v.buf.len();
                     for f in 0..frames {
-                        let i = pos as usize;
-                        let (l, r) = if i + 1 < total {
-                            let fr = (pos - i as f64) as f32;
-                            (
-                                s[2 * i] + (s[2 * i + 2] - s[2 * i]) * fr,
-                                s[2 * i + 1] + (s[2 * i + 3] - s[2 * i + 1]) * fr,
-                            )
-                        } else {
-                            (0.0, 0.0)
-                        };
-                        write_frame(&mut data[f * ch..(f + 1) * ch], l * vol, r * vol);
-                        pos += step;
-                    }
-                    st.pos = pos;
-                    if pos as usize >= total {
-                        st.finished = true;
+                        let i = v.pos as usize;
+                        if i + 1 >= n {
+                            v.pos = n as f64;
+                            break;
+                        }
+                        let fr = (v.pos - i as f64) as f32;
+                        let s = v.buf[i] + (v.buf[i + 1] - v.buf[i]) * fr;
+                        mix[2 * f] += s * gl;
+                        mix[2 * f + 1] += s * gr;
+                        v.pos += step;
                     }
                 }
-                None => {
-                    for v in data.iter_mut() {
-                        *v = T::EQUILIBRIUM;
-                    }
-                }
+                voices.retain(|v| (v.pos as usize) + 1 < v.buf.len());
+            }
+            for f in 0..frames {
+                // Gentle soft clip so effects over a loud master never crackle.
+                let (l, r) = (mix[2 * f], mix[2 * f + 1]);
+                let clip = |x: f32| if x.abs() > 0.9 { x.signum() * (0.9 + 0.1 * ((x.abs() - 0.9) * 10.0).tanh()) } else { x };
+                write_frame(&mut data[f * ch..(f + 1) * ch], clip(l), clip(r));
             }
         },
         move |e| stream_error(&sh_err, "output stream", e),

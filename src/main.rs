@@ -8,6 +8,7 @@ mod game;
 mod level;
 mod render;
 mod rng;
+mod synth;
 mod tools;
 
 use std::collections::VecDeque;
@@ -18,12 +19,12 @@ use std::sync::Arc;
 
 use macroquad::prelude::*;
 
-use analysis::{Analysis, Band, Feat, StreamAnalyzer, StreamOut};
+use analysis::{Analysis, Band, Feat, SectionKind, StreamAnalyzer, StreamOut};
 use decode::Track;
-use engine::Audio;
+use engine::{Audio, Sfx};
 use game::{Input, UpgradeId, World};
-use level::{Ev, Level, LevelEvent, LiveGen};
-use render::{spaced, text_center, text_left, text_shadow, text_w, HudInfo, Renderer};
+use level::{Ev, Level, LevelEvent, LiveGen, Timeline};
+use render::{text_center, text_left, text_shadow, text_w, HudInfo, Renderer};
 
 // ---------------------------------------------------------------------------------------------
 // Command line
@@ -48,13 +49,22 @@ pub struct Args {
     give: u32,
     wall: bool,
     mortal: bool,
+    /// Debug: keep the drift (idle) scene up while the song plays, with no attacks.
+    drift: bool,
+    /// Headless balance simulation over `files`.
+    sim: bool,
+    sample: usize,
+    runs: u32,
+    bot_delay: f32,
+    song_idx: u32,
+    diff_set: bool,
     screen: String,
     live_in: String,
     live_out: String,
 }
 
 fn parse_args() -> Args {
-    let mut a = Args { diff: 1, secs: 30.0, ..Default::default() };
+    let mut a = Args { diff: 1, secs: 30.0, runs: 1, bot_delay: 140.0, ..Default::default() };
     let mut it = std::env::args().skip(1);
     while let Some(arg) = it.next() {
         let mut val = || it.next().unwrap_or_default();
@@ -69,7 +79,13 @@ fn parse_args() -> Args {
             "--seed" => a.seed = val().parse().unwrap_or(0),
             "--ss" => a.ss = val().parse().ok(),
             "--give" => a.give = val().parse().unwrap_or(0),
+            "--sim" => a.sim = true,
+            "--sample" => a.sample = val().parse().unwrap_or(0),
+            "--runs" => a.runs = val().parse().unwrap_or(1),
+            "--bot-delay" => a.bot_delay = val().parse().unwrap_or(140.0),
+            "--song-idx" => a.song_idx = val().parse().unwrap_or(0),
             "--diff" => {
+                a.diff_set = true;
                 a.diff = match val().to_ascii_lowercase().as_str() {
                     "chill" | "0" => 0,
                     "hard" | "2" => 2,
@@ -79,6 +95,7 @@ fn parse_args() -> Args {
             "--mute" => a.mute = true,
             "--wall" => a.wall = true,
             "--mortal" => a.mortal = true,
+            "--drift" => a.drift = true,
             "--live-in" => {
                 a.live_in = val();
                 a.live = true;
@@ -150,7 +167,7 @@ fn main() {
         }
     }));
     let args = parse_args();
-    let cli = args.analyze.is_some() || args.gen_test.is_some() || args.live_probe.is_some();
+    let cli = args.analyze.is_some() || args.gen_test.is_some() || args.live_probe.is_some() || args.sim;
     if cli {
         #[cfg(windows)]
         unsafe {
@@ -191,7 +208,10 @@ struct Loader {
 
 pub fn load_track(path: &Path, seed: u64, diff: f32, progress: &AtomicU32, stage: &AtomicU32) -> Result<Loaded, String> {
     stage.store(0, Ordering::Relaxed);
-    let track = decode::decode_file(path, progress)?;
+    let track = match theme_index(path) {
+        Some(i) => synth::theme(i),
+        None => decode::decode_file(path, progress)?,
+    };
     stage.store(1, Ordering::Relaxed);
     progress.store(0, Ordering::Relaxed);
     let mono = track.mono();
@@ -238,6 +258,7 @@ struct Song {
     track: Arc<Track>,
     an: Arc<Analysis>,
     level: Level,
+    timeline: Arc<Timeline>,
     cursor: usize,
     last_t: f32,
 }
@@ -256,6 +277,9 @@ struct LiveRun {
     last_clock: f32,
     delay: f32,
     hearts: u32,
+    /// Estimated seconds per beat (median of recent kick-to-kick gaps).
+    period: f32,
+    ibis: VecDeque<f32>,
 }
 
 const DIFFS: [(f32, &str); 3] = [(0.65, "CHILL  (no-fail)"), (1.0, "NORMAL"), (1.35, "HARD")];
@@ -276,10 +300,19 @@ struct App {
     idle: f32,
     diff: usize,
     volume: f32,
+    sfx_volume: f32,
+    /// Extra audio latency in ms (soundbars, Bluetooth): events are delayed by this much.
+    offset_ms: f32,
+    music_dir: Option<PathBuf>,
+    juke: Jukebox,
     autofire: bool,
     fullscreen: bool,
     menu_sel: usize,
     dialog: Option<Receiver<Vec<PathBuf>>>,
+    /// True when the open folder dialog is choosing the music library (not starting a run).
+    dialog_library: bool,
+    /// Escape / P was consumed this frame (so pausing does not instantly un-pause).
+    esc_used: bool,
     message: String,
     message_t: f32,
     died: bool,
@@ -296,7 +329,99 @@ struct App {
     log: Vec<String>,
 }
 
+/// Built-in synthesised tracks travel through playlists as pseudo paths ("::theme0").
+fn theme_path(i: usize) -> PathBuf {
+    PathBuf::from(format!("::theme{i}"))
+}
+
+fn theme_index(p: &Path) -> Option<usize> {
+    p.to_str()?.strip_prefix("::theme")?.parse().ok()
+}
+
+/// Where the menu starts previewing a track: a bar before its first big section.
+fn preview_start(an: &Analysis) -> f32 {
+    let beat = if an.bpm > 1.0 { 60.0 / an.bpm } else { 0.5 };
+    an.sections
+        .iter()
+        .find(|s| matches!(s.kind, SectionKind::Intense | SectionKind::Drop) && s.t0 > 1.0 && s.t0 < an.duration * 0.7)
+        .map(|s| (s.t0 - 4.0 * beat).max(0.0))
+        .unwrap_or(0.0)
+}
+
+/// The menu's music: plays through the library (or the built-in tracks), fully analysed so
+/// the menu scene reacts to it and so pressing PLAY starts instantly.
+struct Jukebox {
+    list: Vec<PathBuf>,
+    idx: usize,
+    loaded: Option<(PathBuf, Loaded)>,
+    loader: Option<(PathBuf, Loader)>,
+    cursor: usize,
+    last_t: f32,
+    playing: bool,
+    fails: u32,
+}
+
+// ---------------------------------------------------------------------------------------------
+// Settings (heartline.cfg next to the exe)
+// ---------------------------------------------------------------------------------------------
+
+fn settings_path() -> Option<PathBuf> {
+    std::env::current_exe().ok().map(|e| e.with_file_name("heartline.cfg"))
+}
+
+fn load_settings() -> std::collections::HashMap<String, String> {
+    let mut m = std::collections::HashMap::new();
+    if let Some(text) = settings_path().and_then(|p| std::fs::read_to_string(p).ok()) {
+        for line in text.lines() {
+            if let Some((k, v)) = line.split_once('=') {
+                m.insert(k.trim().to_string(), v.trim().to_string());
+            }
+        }
+    }
+    m
+}
+
+/// The user's Music folder (honours a relocated library).
+#[cfg(windows)]
+fn music_folder() -> Option<PathBuf> {
+    use std::ffi::c_void;
+    #[repr(C)]
+    struct Guid(u32, u16, u16, [u8; 8]);
+    #[link(name = "shell32")]
+    extern "system" {
+        fn SHGetKnownFolderPath(rfid: *const Guid, flags: u32, token: *mut c_void, path: *mut *mut u16) -> i32;
+    }
+    #[link(name = "ole32")]
+    extern "system" {
+        fn CoTaskMemFree(p: *mut c_void);
+    }
+    // FOLDERID_Music {4BD8D571-6D19-48D3-BE97-422220080E43}
+    let id = Guid(0x4BD8_D571, 0x6D19, 0x48D3, [0xBE, 0x97, 0x42, 0x22, 0x20, 0x08, 0x0E, 0x43]);
+    let mut raw: *mut u16 = std::ptr::null_mut();
+    let hr = unsafe { SHGetKnownFolderPath(&id, 0, std::ptr::null_mut(), &mut raw) };
+    if hr != 0 || raw.is_null() {
+        return None;
+    }
+    let mut len = 0usize;
+    unsafe {
+        while *raw.add(len) != 0 && len < 4096 {
+            len += 1;
+        }
+        let s = String::from_utf16_lossy(std::slice::from_raw_parts(raw, len));
+        CoTaskMemFree(raw as *mut c_void);
+        Some(PathBuf::from(s))
+    }
+}
+
+#[cfg(not(windows))]
+fn music_folder() -> Option<PathBuf> {
+    std::env::var_os("HOME").map(|h| PathBuf::from(h).join("Music"))
+}
+
 fn track_title(p: &Path) -> String {
+    if let Some(i) = theme_index(p) {
+        return synth::theme_name(i).to_string();
+    }
     p.file_stem().and_then(|s| s.to_str()).unwrap_or("untitled").to_string()
 }
 
@@ -335,7 +460,151 @@ impl App {
         self.message_t = 5.0;
     }
 
+    fn save_settings(&self) {
+        if self.args.selftest.is_some() {
+            return;
+        }
+        let Some(path) = settings_path() else { return };
+        let mut text = format!(
+            "diff={}\nvolume={:.2}\nsfx={:.2}\noffset_ms={:.0}\nautofire={}\n",
+            self.diff, self.volume, self.sfx_volume, self.offset_ms, self.autofire as u8
+        );
+        if let Some(d) = &self.music_dir {
+            text.push_str(&format!("music_dir={}\n", d.display()));
+        }
+        let _ = std::fs::write(path, text);
+    }
+
+    /// Rebuild the menu playlist: the library (shuffled), then the built-in tracks.
+    fn juke_rescan(&mut self) {
+        let mut lib = self.music_dir.as_ref().map(|d| expand_paths(&[d.clone()])).unwrap_or_default();
+        let seed = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos() as u64).unwrap_or(1);
+        let mut rng = rng::Rng::new(if self.args.selftest.is_some() { 7 } else { seed });
+        for i in (1..lib.len()).rev() {
+            lib.swap(i, rng.below(i + 1));
+        }
+        let first_theme = rng.below(synth::THEME_COUNT);
+        lib.extend((0..synth::THEME_COUNT).map(|k| theme_path((first_theme + k) % synth::THEME_COUNT)));
+        self.juke = Jukebox { list: lib, idx: 0, loaded: None, loader: None, cursor: 0, last_t: -1.0, playing: false, fails: 0 };
+    }
+
+    fn juke_next(&mut self, dir: i32) {
+        let n = self.juke.list.len() as i32;
+        if n > 1 {
+            self.juke.idx = (self.juke.idx as i32 + dir).rem_euclid(n) as usize;
+            self.juke.loader = None;
+            self.juke.fails = 0;
+            self.audio.sfx(Sfx::UiMove, 0.8, 0.0);
+        }
+    }
+
+    /// Menu-like screens: keep the menu music loaded and playing, and drive the world's music
+    /// signals from it so the scene is a visualiser. Returns progress through the track.
+    fn juke_step(&mut self, dt: f32, input: &Input) -> f32 {
+        let mut done = None;
+        if let Some((path, l)) = &self.juke.loader {
+            if let Ok(res) = l.rx.try_recv() {
+                done = Some((path.clone(), res));
+            }
+        }
+        if let Some((path, res)) = done {
+            self.juke.loader = None;
+            match res {
+                Ok(loaded) => {
+                    if self.juke.list.get(self.juke.idx) == Some(&path) {
+                        self.juke.loaded = Some((path, loaded));
+                        self.juke.playing = false;
+                        self.juke.fails = 0;
+                    }
+                }
+                Err(_) => {
+                    self.juke.fails += 1;
+                    self.juke.list.retain(|p| *p != path);
+                    if self.juke.idx >= self.juke.list.len() {
+                        self.juke.idx = 0;
+                    }
+                }
+            }
+        }
+        let n = self.juke.list.len();
+        if n > 0 && self.juke.loader.is_none() && self.juke.fails < 6 {
+            let want = self.juke.list[self.juke.idx % n].clone();
+            if self.juke.loaded.as_ref().map(|l| &l.0) != Some(&want) {
+                let l = spawn_loader(0, want.clone(), self.args.seed, self.diff());
+                self.juke.loader = Some((want, l));
+            }
+        }
+        if !self.juke.playing {
+            if let Some((path, loaded)) = &self.juke.loaded {
+                let start = if theme_index(path).is_some() { 0.0 } else { preview_start(&loaded.an) };
+                self.audio.play_ex(loaded.track.clone(), start as f64, true, 0.9);
+                self.juke.playing = true;
+                self.juke.last_t = -1.0;
+                self.world.warp = 1.0;
+                self.world.beat_len = if loaded.level.bpm > 1.0 { 60.0 / loaded.level.bpm } else { 0.5 };
+            }
+        }
+        let mut feat = Feat::default();
+        let mut bp = self.rend.time * 100.0 / 60.0;
+        let mut intensity = 0.0;
+        let mut progress = 0.0;
+        if self.juke.playing {
+            if let Some((_, loaded)) = &self.juke.loaded {
+                let t = self.audio.song_time() as f32;
+                let ev = &loaded.level.events;
+                if self.juke.last_t < 0.0 || t < self.juke.last_t - 0.3 {
+                    // Started or looped: find our place and restore the section look.
+                    self.juke.cursor = ev.partition_point(|e| e.at() <= t);
+                    if let Some(e) = ev[..self.juke.cursor].iter().rev().find(|e| matches!(e.ev, Ev::Section { .. })) {
+                        self.world.apply(e);
+                    }
+                }
+                self.juke.last_t = t;
+                self.world.t = t;
+                while self.juke.cursor < ev.len() && ev[self.juke.cursor].at() <= t {
+                    let e = ev[self.juke.cursor];
+                    self.juke.cursor += 1;
+                    if matches!(e.ev, Ev::Beat { .. } | Ev::Hit { .. } | Ev::Section { .. }) {
+                        self.world.apply(&e);
+                    }
+                }
+                feat = feat_at(&loaded.an, t);
+                bp = beat_pos(&loaded.level.beats, t);
+                intensity = loaded.an.intensity_at(t);
+                progress = t / loaded.level.duration.max(0.1);
+            }
+        }
+        let t = self.world.t;
+        self.world.update(dt, t, input, bp, &feat, intensity, false);
+        progress
+    }
+
+    /// Start a run with the track the menu is playing, plus `extra` more from the playlist.
+    fn start_from_juke(&mut self, extra: usize) {
+        let n = self.juke.list.len();
+        if n == 0 {
+            self.say("no music found - choose a MUSIC LIBRARY folder or drop files on the window");
+            return;
+        }
+        let mut paths = vec![self.juke.list[self.juke.idx % n].clone()];
+        for k in 1..=extra {
+            let p = self.juke.list[(self.juke.idx + k) % n].clone();
+            if !paths.contains(&p) {
+                paths.push(p);
+            }
+        }
+        // The menu already analysed this track: reuse it so the level starts instantly.
+        let reuse = self.juke.loaded.as_ref().filter(|(p, _)| *p == paths[0]).map(|(_, l)| (l.track.clone(), l.an.clone()));
+        self.start_run(paths);
+        if let Some((track, an)) = reuse {
+            let level = level::generate(&an, self.args.seed, self.diff());
+            self.loader = None;
+            self.ready = Some((0, Loaded { track, an, level }));
+        }
+    }
+
     fn to_menu(&mut self) {
+        self.juke.playing = false;
         self.audio.stop();
         self.audio.stop_live();
         self.song = None;
@@ -352,7 +621,11 @@ impl App {
             self.say("no playable audio files found");
             return;
         }
-        self.audio.stop();
+        // Menu music keeps playing through the loading screen and cross-fades into the level.
+        if !self.juke.playing {
+            self.audio.stop();
+        }
+        self.juke.playing = false;
         self.audio.stop_live();
         self.live = None;
         self.song = None;
@@ -378,6 +651,7 @@ impl App {
         let playback = if self.out_sel == 0 { None } else { devs.get(self.out_sel - 1).map(|d| d.id.clone()) };
         let delayed = playback.is_some() && playback != capture;
         let delay = if delayed { self.delay } else { 0.0 };
+        self.juke.playing = false;
         self.audio.stop();
         self.audio.start_live(capture, playback, delay);
         self.song = None;
@@ -402,6 +676,8 @@ impl App {
             last_clock: 0.0,
             delay,
             hearts: 0,
+            period: 0.5,
+            ibis: VecDeque::new(),
         });
         self.died = false;
         self.screen = Screen::Play;
@@ -448,7 +724,9 @@ impl App {
     fn begin_song(&mut self, loaded: Loaded) {
         let start = if self.qi == 0 { self.args.start.max(0.0) } else { 0.0 };
         self.world.begin_song(loaded.level.active_secs, self.qi as u32, loaded.level.seed);
-        let mut song = Song { track: loaded.track, an: loaded.an, level: loaded.level, cursor: 0, last_t: start };
+        self.world.beat_len = if loaded.level.bpm > 1.0 { 60.0 / loaded.level.bpm } else { 0.5 };
+        let timeline = Arc::new(Timeline::from_analysis(&loaded.an));
+        let mut song = Song { track: loaded.track, an: loaded.an, level: loaded.level, timeline, cursor: 0, last_t: start };
         if start > 0.0 {
             // Skip what is already in the past, but keep the latest section so the look is right.
             let mut last_section = None;
@@ -464,7 +742,9 @@ impl App {
             }
         }
         self.audio.set_volume(if self.args.mute { 0.0 } else { self.volume });
-        self.audio.play(song.track.clone(), start as f64);
+        let fade = if self.audio.has_track() { 0.45 } else { 0.0 };
+        self.audio.play_ex(song.track.clone(), start as f64, false, fade);
+        self.juke.playing = false;
         self.song = Some(song);
         self.phase = Phase::Song;
     }
@@ -533,7 +813,7 @@ impl App {
                     self.phase = Phase::Loading;
                     return (1.0, hud, 0.0);
                 };
-                let mut t = self.audio.song_time() as f32;
+                let mut t = (self.audio.song_time() as f32 - self.offset_ms / 1000.0).max(0.0);
                 if t < song.last_t {
                     t = song.last_t;
                 }
@@ -541,12 +821,15 @@ impl App {
                 t = t.min(song.last_t + 0.25);
                 song.last_t = t;
                 self.world.t = t;
+                let drift = self.args.drift;
                 while song.cursor < song.level.events.len() && song.level.events[song.cursor].at() <= t {
                     let e = song.level.events[song.cursor];
                     song.cursor += 1;
-                    self.world.apply(&e);
+                    if !drift || matches!(e.ev, Ev::Beat { .. } | Ev::Hit { .. } | Ev::Section { .. } | Ev::End) {
+                        self.world.apply(&e);
+                    }
                 }
-                let silent = song.an.in_silence(t) && song.an.in_silence(t + 0.7);
+                let silent = drift || (song.an.in_silence(t) && song.an.in_silence(t + 0.7));
                 let feat = feat_at(&song.an, t);
                 let intensity = song.an.intensity_at(t);
                 let bp = beat_pos(&song.level.beats, t);
@@ -556,7 +839,8 @@ impl App {
                 hud.progress = t / dur;
                 hud.time_left = dur - t;
                 hud.bpm = song.level.bpm;
-                hud.show_combat = true;
+                hud.show_combat = !drift;
+                hud.timeline = Some(song.timeline.clone());
                 let finished = self.world.ended || (self.audio.finished() && t >= dur - 0.3);
                 if self.world.dead {
                     self.phase = Phase::Dying(0.0);
@@ -570,7 +854,7 @@ impl App {
                     self.qi += 1;
                     self.song = None;
                     if self.qi < self.queue.len() {
-                        self.world.spawn_orbs(30.0);
+                        self.world.spawn_orbs(22.0);
                         self.phase = Phase::Intermission(0.0);
                     } else {
                         self.screen = Screen::Results;
@@ -587,7 +871,7 @@ impl App {
                 self.world.update(dt, t, &inp, idle_beat, &Feat::default(), 0.0, false);
                 hud.title = self.queue.get(self.qi).map(|p| format!("NEXT  {}", track_title(p))).unwrap_or_default();
                 hud.banner = "TRACK CLEAR".into();
-                hud.banner_a = (it * 3.0).min(1.0) * ((3.2 - it) * 2.0).clamp(0.0, 1.0);
+                hud.banner_a = (it * 3.0).min(1.0) * ((2.2 - it) * 2.5).clamp(0.0, 1.0);
                 let ready = self.ready.as_ref().map(|r| r.0 == self.qi).unwrap_or(false);
                 hud.status = if !self.world.orbs.is_empty() {
                     "FLY INTO AN UPGRADE".into()
@@ -596,8 +880,9 @@ impl App {
                 } else {
                     String::new()
                 };
-                if ready && ((it > 3.0 && self.world.orbs.is_empty()) || it > 12.0) {
-                    self.world.orbs.clear();
+                // The next track rolls in after a short breath; upgrade orbs stay on the field
+                // through its opening seconds (nothing attacks yet).
+                if ready && it > 2.0 {
                     let (_, loaded) = self.ready.take().unwrap();
                     self.begin_song(loaded);
                 }
@@ -654,6 +939,7 @@ impl App {
         live.out.feats.clear();
         live.out.onsets.clear();
         an.push(&live.buf, &mut live.out);
+        let live_beat = an.live_beat();
         let mut fresh: Vec<LevelEvent> = Vec::new();
         for &(ft, f, raw) in &live.out.feats {
             live.gen.feed(ft, f.rms, &mut fresh);
@@ -662,6 +948,21 @@ impl App {
         for o in &live.out.onsets {
             live.gen.on_onset(o, &mut fresh);
             if o.band == Band::Low && o.strength > 0.3 && o.t - live.last_beat_t > 0.28 {
+                // Fold the gap into the 0.33..0.9 s range (about 67..180 BPM) and keep a running median.
+                let mut gap = o.t - live.last_beat_t;
+                while gap > 0.9 {
+                    gap *= 0.5;
+                }
+                if gap >= 0.3 {
+                    live.ibis.push_back(gap);
+                    if live.ibis.len() > 15 {
+                        live.ibis.pop_front();
+                    }
+                    let mut v: Vec<f32> = live.ibis.iter().copied().collect();
+                    v.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+                    live.period = v[v.len() / 2];
+                    live.gen.beat_len = live.period;
+                }
                 live.last_beat_t = o.t;
                 live.beat_n += 1;
                 fresh.push(LevelEvent { t: o.t, lead: 0.0, ev: Ev::Beat { down: live.beat_n % 4 == 1 } });
@@ -730,7 +1031,16 @@ impl App {
             }
         }
         let intensity = live.gen.intensity;
-        self.world.update(dt, clock, input, clock * 2.0, &feat, intensity, !idle_now);
+        // Prefer the analyser's tempo tracker once it is confident; until then follow the kicks.
+        let live_bp = if live_beat.conf > 0.4 && live_beat.period > 0.2 {
+            live.period = live_beat.period;
+            live.gen.beat_len = live.period;
+            (clock - live_beat.phase_t) / live_beat.period
+        } else {
+            live.beat_n as f32 + ((clock - live.last_beat_t) / live.period.max(0.2)).clamp(0.0, 0.999)
+        };
+        self.world.beat_len = live.period;
+        self.world.update(dt, clock, input, live_bp, &feat, intensity, !idle_now);
 
         hud.mode = if info.delayed {
             format!("LIVE  -  DELAYED {:.1}s LOOK-AHEAD", live.delay)
@@ -760,7 +1070,8 @@ fn hud_progress(t: f32, dur: f32) -> f32 {
 // ---------------------------------------------------------------------------------------------
 
 /// Draws a vertical list of buttons. Returns the index that was activated (click / Enter).
-fn menu_list(items: &[String], sel: &mut usize, x: f32, y: f32, u: f32, pal: &render::Palette) -> Option<usize> {
+fn menu_list(items: &[String], sel: &mut usize, x: f32, y: f32, u: f32, rend: &Renderer, audio: &Audio) -> Option<usize> {
+    let before = *sel;
     let (mx, my) = mouse_position();
     let h = 46.0 * u;
     let w = 520.0 * u;
@@ -777,14 +1088,7 @@ fn menu_list(items: &[String], sel: &mut usize, x: f32, y: f32, u: f32, pal: &re
         if hover && mouse_delta_position() != Vec2::ZERO {
             *sel = i;
         }
-        let on = *sel == i;
-        let bg = if on { Color::new(pal.secondary.r, pal.secondary.g, pal.secondary.b, 0.28) } else { Color::new(0.0, 0.0, 0.05, 0.5) };
-        draw_rectangle(x, by, w, h, bg);
-        draw_rectangle(x, by, 5.0 * u, h, if on { pal.accent } else { Color::new(1.0, 1.0, 1.0, 0.25) });
-        if on {
-            draw_rectangle_lines(x, by, w, h, 2.0 * u, pal.secondary);
-        }
-        text_left(it, x + 22.0 * u, by + h * 0.68, 28.0 * u, if on { WHITE } else { Color::new(1.0, 1.0, 1.0, 0.75) });
+        rend.draw_button(x, by, w, h, it, *sel == i, u);
         if hover && is_mouse_button_pressed(MouseButton::Left) {
             *sel = i;
             activated = Some(i);
@@ -793,6 +1097,11 @@ fn menu_list(items: &[String], sel: &mut usize, x: f32, y: f32, u: f32, pal: &re
     if is_key_pressed(KeyCode::Enter) || is_key_pressed(KeyCode::KpEnter) {
         activated = Some(*sel);
     }
+    if activated.is_some() {
+        audio.sfx(Sfx::UiSelect, 0.8, 0.0);
+    } else if *sel != before {
+        audio.sfx(Sfx::UiMove, 0.6, 0.0);
+    }
     activated
 }
 
@@ -800,13 +1109,6 @@ fn dim(a: f32) {
     draw_rectangle(0.0, 0.0, screen_width(), screen_height(), Color::new(0.02, 0.0, 0.06, a));
 }
 
-fn title_block(u: f32, pal: &render::Palette, time: f32) {
-    let x = 110.0 * u;
-    let wob = (time * 1.2).sin() * 3.0 * u;
-    text_left(&spaced("HEARTLINE"), x + 4.0 * u, 214.0 * u + wob, 92.0 * u, Color::new(pal.secondary.r, pal.secondary.g, pal.secondary.b, 0.8));
-    text_left(&spaced("HEARTLINE"), x, 210.0 * u + wob, 92.0 * u, WHITE);
-    text_left("your music is the level", x + 4.0 * u, 250.0 * u, 28.0 * u, pal.primary);
-}
 
 // ---------------------------------------------------------------------------------------------
 // Main loop
@@ -831,10 +1133,16 @@ async fn run(args: Args) {
         idle: 1.0,
         diff,
         volume: 0.8,
+        sfx_volume: 0.5,
+        offset_ms: 0.0,
+        music_dir: None,
+        juke: Jukebox { list: Vec::new(), idx: 0, loaded: None, loader: None, cursor: 0, last_t: -1.0, playing: false, fails: 0 },
         autofire: true,
         fullscreen: false,
         menu_sel: 0,
         dialog: None,
+        dialog_library: false,
+        esc_used: false,
         message: String::new(),
         message_t: 0.0,
         died: false,
@@ -849,7 +1157,22 @@ async fn run(args: Args) {
         log: Vec::new(),
         args: args.clone(),
     };
+    // ---- settings ----
+    let cfg = load_settings();
+    let getf = |k: &str, d: f32| -> f32 { cfg.get(k).and_then(|v| v.parse().ok()).unwrap_or(d) };
+    if !args.diff_set {
+        app.diff = (getf("diff", 1.0) as usize).min(2);
+    }
+    app.volume = getf("volume", 0.8).clamp(0.0, 1.0);
+    app.sfx_volume = getf("sfx", 0.5).clamp(0.0, 1.0);
+    app.offset_ms = getf("offset_ms", 0.0).clamp(-100.0, 300.0);
+    app.autofire = getf("autofire", 1.0) > 0.5;
+    app.music_dir = cfg.get("music_dir").map(PathBuf::from).filter(|p| p.is_dir()).or_else(|| music_folder().filter(|p| p.is_dir()));
+    app.world = World::new(app.diff(), app.diff == 0);
+    app.juke_rescan();
     app.audio.set_volume(if args.mute { 0.0 } else { app.volume });
+    app.audio.set_sfx_volume(if args.mute { 0.0 } else { app.sfx_volume });
+    app.audio.ensure_output();
     if let Some(dir) = &args.selftest {
         let _ = std::fs::create_dir_all(dir);
     }
@@ -886,6 +1209,7 @@ async fn run(args: Args) {
         app.frames += 1;
         app.wall += dt;
         app.message_t = (app.message_t - dt).max(0.0);
+        app.esc_used = false;
 
         // ---- global keys ----
         if is_key_pressed(KeyCode::F11) {
@@ -914,7 +1238,14 @@ async fn run(args: Args) {
         }
         if let Some(p) = picked {
             app.dialog = None;
-            if !p.is_empty() {
+            if app.dialog_library {
+                app.dialog_library = false;
+                if let Some(dir) = p.into_iter().next() {
+                    app.music_dir = Some(dir);
+                    app.juke_rescan();
+                    app.save_settings();
+                }
+            } else if !p.is_empty() {
                 let paths = expand_paths(&p);
                 app.start_run(paths);
             }
@@ -939,13 +1270,19 @@ async fn run(args: Args) {
                 idle_target = it;
                 hud = h;
                 progress = pr;
-                if is_key_pressed(KeyCode::Escape) && app.screen == Screen::Play {
+                let esc = is_key_pressed(KeyCode::Escape);
+                let pause_key = esc || is_key_pressed(KeyCode::P);
+                if pause_key && app.screen == Screen::Play {
+                    app.esc_used = true;
                     if app.live.is_some() {
-                        app.to_menu();
+                        if esc {
+                            app.to_menu();
+                        }
                     } else {
                         app.audio.set_paused(true);
                         app.screen = Screen::Paused;
                         app.menu_sel = 0;
+                        app.audio.sfx(Sfx::UiSelect, 0.7, 0.0);
                     }
                 }
             }
@@ -959,12 +1296,17 @@ async fn run(args: Args) {
                 }
             }
             _ => {
-                // Menu-like screens: drift mode, the player can still fly around.
+                // Menu-like screens: drift mode with the menu music; the player can still fly around.
                 let mut input = app.gather_input(false);
                 input.dash = false;
-                let t = app.world.t;
-                let ib = app.rend.time * 100.0 / 60.0;
-                app.world.update(dt, t, &input, ib, &Feat::default(), 0.0, false);
+                progress = app.juke_step(dt, &input);
+            }
+        }
+        // Sound effects the simulation asked for (not in live mode: the capture would hear them).
+        let quiet = app.live.is_some();
+        for (s, gain, pan) in app.world.sounds.drain(..) {
+            if !quiet {
+                app.audio.sfx(s, gain, pan);
             }
         }
 
@@ -986,31 +1328,51 @@ async fn run(args: Args) {
 
         match app.screen {
             Screen::Menu => {
-                title_block(u, &pal, app.rend.time);
+                app.rend.draw_logo(110.0 * u, 96.0 * u, u, &app.world);
+                let lib_name = app
+                    .music_dir
+                    .as_ref()
+                    .and_then(|d| d.file_name())
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("none")
+                    .to_string();
+                let n_lib = app.juke.list.len().saturating_sub(synth::THEME_COUNT);
                 let items = vec![
+                    "PLAY THIS TRACK".to_string(),
+                    "SHUFFLE RUN   (5 tracks)".to_string(),
                     "PLAY FILES...".to_string(),
                     "PLAY FOLDER...".to_string(),
-                    "LIVE AUDIO  (what your PC is playing)".to_string(),
+                    format!("MUSIC LIBRARY   {lib_name}  ({n_lib} tracks)"),
+                    "LIVE AUDIO   (what your PC is playing)".to_string(),
                     format!("DIFFICULTY   {}", DIFFS[app.diff].1),
-                    format!("VOLUME   {:.0}%", app.volume * 100.0),
+                    format!("MUSIC VOLUME   {:.0}%", app.volume * 100.0),
+                    format!("EFFECTS VOLUME   {:.0}%", app.sfx_volume * 100.0),
+                    format!("SYNC OFFSET   {:+.0} ms", app.offset_ms),
                     format!("FULLSCREEN   {}", if app.fullscreen { "ON" } else { "OFF" }),
                     "QUIT".to_string(),
                 ];
-                let act = if app.dialog.is_none() { menu_list(&items, &mut app.menu_sel, 110.0 * u, 320.0 * u, u, &pal) } else { None };
-                // left/right adjusts the selected setting
+                let act = if app.dialog.is_none() { menu_list(&items, &mut app.menu_sel, 110.0 * u, 280.0 * u, u, &app.rend, &app.audio) } else { None };
+                // left/right adjusts the selected row; on the play rows it changes the track
                 let dirk = is_key_pressed(KeyCode::Right) as i32 - is_key_pressed(KeyCode::Left) as i32;
+                let track_dirk = is_key_pressed(KeyCode::E) as i32 - is_key_pressed(KeyCode::Q) as i32 + if app.menu_sel <= 1 { dirk } else { 0 };
+                if track_dirk != 0 && app.dialog.is_none() {
+                    app.juke_next(track_dirk);
+                }
+                let mut changed = false;
                 if dirk != 0 {
+                    changed = true;
                     match app.menu_sel {
-                        3 => app.diff = ((app.diff as i32 + dirk).rem_euclid(3)) as usize,
-                        4 => {
-                            app.volume = (app.volume + 0.1 * dirk as f32).clamp(0.0, 1.0);
-                            app.audio.set_volume(app.volume);
-                        }
-                        _ => {}
+                        6 => app.diff = ((app.diff as i32 + dirk).rem_euclid(3)) as usize,
+                        7 => app.volume = (app.volume + 0.1 * dirk as f32).clamp(0.0, 1.0),
+                        8 => app.sfx_volume = (app.sfx_volume + 0.1 * dirk as f32).clamp(0.0, 1.0),
+                        9 => app.offset_ms = (app.offset_ms + 10.0 * dirk as f32).clamp(-100.0, 300.0),
+                        _ => changed = false,
                     }
                 }
                 match act {
-                    Some(0) => {
+                    Some(0) => app.start_from_juke(0),
+                    Some(1) => app.start_from_juke(4),
+                    Some(2) => {
                         let (tx, rx) = channel();
                         std::thread::spawn(move || {
                             let exts: Vec<&str> = decode::AUDIO_EXTS.to_vec();
@@ -1018,35 +1380,76 @@ async fn run(args: Args) {
                             let _ = tx.send(r.unwrap_or_default());
                         });
                         app.dialog = Some(rx);
+                        app.dialog_library = false;
                     }
-                    Some(1) => {
+                    Some(3) | Some(4) => {
+                        let library = act == Some(4);
                         let (tx, rx) = channel();
+                        let start_dir = app.music_dir.clone();
                         std::thread::spawn(move || {
-                            let r = rfd::FileDialog::new().set_title("Heartline - choose a music folder").pick_folder();
-                            let _ = tx.send(r.map(|p| vec![p]).unwrap_or_default());
+                            let mut d = rfd::FileDialog::new().set_title(if library { "Heartline - choose your music library folder" } else { "Heartline - choose a music folder to play" });
+                            if let Some(sd) = start_dir {
+                                d = d.set_directory(sd);
+                            }
+                            let _ = tx.send(d.pick_folder().map(|p| vec![p]).unwrap_or_default());
                         });
                         app.dialog = Some(rx);
+                        app.dialog_library = library;
                     }
-                    Some(2) => {
+                    Some(5) => {
                         app.audio.refresh_devices();
                         app.screen = Screen::LiveSetup;
                         app.menu_sel = 0;
                     }
-                    Some(3) => app.diff = (app.diff + 1) % 3,
-                    Some(4) => {
-                        app.volume = if app.volume >= 0.99 { 0.0 } else { (app.volume + 0.1).min(1.0) };
-                        app.audio.set_volume(app.volume);
+                    Some(6) => {
+                        app.diff = (app.diff + 1) % 3;
+                        changed = true;
                     }
-                    Some(5) => {
+                    Some(7) => {
+                        app.volume = if app.volume >= 0.99 { 0.0 } else { (app.volume + 0.1).min(1.0) };
+                        changed = true;
+                    }
+                    Some(8) => {
+                        app.sfx_volume = if app.sfx_volume >= 0.99 { 0.0 } else { (app.sfx_volume + 0.1).min(1.0) };
+                        changed = true;
+                    }
+                    Some(9) => {
+                        app.offset_ms = if app.offset_ms >= 295.0 { -100.0 } else { app.offset_ms + 10.0 };
+                        changed = true;
+                    }
+                    Some(10) => {
                         app.fullscreen = !app.fullscreen;
                         set_fullscreen(app.fullscreen);
                     }
-                    Some(6) => break,
+                    Some(11) => break,
                     _ => {}
                 }
+                if changed {
+                    let mute = app.args.mute;
+                    app.audio.set_volume(if mute { 0.0 } else { app.volume });
+                    app.audio.set_sfx_volume(if mute { 0.0 } else { app.sfx_volume });
+                    if app.menu_sel == 8 {
+                        app.audio.sfx(Sfx::Shard, 1.0, 0.0);
+                    }
+                    app.save_settings();
+                }
+                // Now-playing card
+                let (title, hint) = match (&app.juke.loaded, app.juke.list.get(app.juke.idx)) {
+                    (_, None) => ("no music found".to_string(), "choose MUSIC LIBRARY or drop files on the window".to_string()),
+                    (Some((p, l)), Some(want)) if p == want => (l.track.name.clone(), "Q / E  change track        ENTER  play it".to_string()),
+                    (_, Some(want)) => (track_title(want), "reading the music...".to_string()),
+                };
+                let title: String = if title.chars().count() > 38 { title.chars().take(37).chain("…".chars()).collect() } else { title };
+                app.rend.draw_now_playing(sw - 700.0 * u, 110.0 * u, 590.0 * u, u, &app.world, &title, &hint, progress);
                 let hy = sh - 60.0 * u;
-                text_shadow("drop audio files or folders on the window to play", 110.0 * u, hy, 24.0 * u, Color::new(1.0, 1.0, 1.0, 0.8), -1);
-                text_shadow("WASD move   mouse aim   SPACE dash   F auto-fire   ESC pause   F11 fullscreen", 110.0 * u, hy + 28.0 * u, 20.0 * u, Color::new(1.0, 1.0, 1.0, 0.55), -1);
+                let help = match app.menu_sel {
+                    9 => "SYNC OFFSET: raise it if attacks land before you hear the beat (soundbar / Bluetooth lag), lower it if they land late",
+                    4 => "MUSIC LIBRARY: the folder the menu plays from and SHUFFLE RUN draws its tracks from",
+                    1 => "SHUFFLE RUN: this track plus four more; HP, upgrades and score carry over and the Heart gets tougher",
+                    _ => "drop audio files or folders on the window to play them",
+                };
+                text_shadow(help, 110.0 * u, hy, 22.0 * u, Color::new(1.0, 1.0, 1.0, 0.8), -1);
+                text_shadow("WASD move   mouse aim   SPACE dash   F auto-fire   ESC / P pause   F11 fullscreen", 110.0 * u, hy + 28.0 * u, 20.0 * u, Color::new(1.0, 1.0, 1.0, 0.55), -1);
                 if app.dialog.is_some() {
                     text_shadow("waiting for the file dialog...", sw * 0.5, sh * 0.5, 28.0 * u, pal.accent, 0);
                 }
@@ -1055,7 +1458,7 @@ async fn run(args: Args) {
                 dim(0.66);
                 let devs = app.audio.devices();
                 let x = 110.0 * u;
-                text_left(&spaced("LIVE AUDIO"), x, 130.0 * u, 64.0 * u, WHITE);
+                render::vtext("LIVE AUDIO", x, 130.0 * u, 64.0 * u, WHITE, -1);
                 text_left("Heartline listens to an output device and builds the level on the fly.", x, 170.0 * u, 24.0 * u, pal.primary);
 
                 let (mx, my) = mouse_position();
@@ -1146,10 +1549,10 @@ async fn run(args: Args) {
             }
             Screen::Paused => {
                 dim(0.55);
-                text_center(&spaced("PAUSED"), sw * 0.5, sh * 0.3, 80.0 * u, WHITE);
+                render::vtext("PAUSED", sw * 0.5, sh * 0.3, 80.0 * u, WHITE, 0);
                 let items = vec!["RESUME".to_string(), "RESTART RUN".to_string(), "QUIT TO MENU".to_string()];
-                let act = menu_list(&items, &mut app.menu_sel, sw * 0.5 - 260.0 * u, sh * 0.42, u, &pal);
-                if is_key_pressed(KeyCode::Escape) || act == Some(0) {
+                let act = menu_list(&items, &mut app.menu_sel, sw * 0.5 - 260.0 * u, sh * 0.42, u, &app.rend, &app.audio);
+                if ((is_key_pressed(KeyCode::Escape) || is_key_pressed(KeyCode::P)) && !app.esc_used) || act == Some(0) {
                     app.audio.set_paused(false);
                     app.screen = Screen::Play;
                 } else if act == Some(1) {
@@ -1164,7 +1567,7 @@ async fn run(args: Args) {
                 dim(0.64);
                 let st = app.world.stats;
                 let head = if app.died { "SIGNAL LOST" } else { "RUN COMPLETE" };
-                text_center(&spaced(head), sw * 0.5, sh * 0.2, 84.0 * u, if app.died { pal.danger } else { pal.accent });
+                render::vtext(head, sw * 0.5, sh * 0.2, 84.0 * u, if app.died { pal.danger } else { pal.accent }, 0);
                 text_center(&format!("{:08}", app.world.score), sw * 0.5, sh * 0.32, 96.0 * u, WHITE);
                 let rank = if app.died {
                     "C"
@@ -1262,6 +1665,7 @@ async fn run(args: Args) {
 
         next_frame().await;
     }
+    app.save_settings();
     app.audio.stop();
     app.audio.stop_live();
 }
