@@ -126,6 +126,26 @@ Build / run / test:
 - Delayed live mode needs two output devices. Output devices here: "Soundbar Speaker (Realtek(R)
   Audio)" (default) and "Razer Headphones (Razer Kraken V3)".
 - Solus Heart (RoR2) and WindowKill are feel references only.
+- 2026-11-14 — LAN Rally (`docs/plans/lan-rally.md`). Networking is in `net.rs` (std only):
+  - UDP beacon `HEARTLINE1 <name> <port>` on port 47821, and one TCP connection on 47820
+    (`TCP_NODELAY`).
+  - Frames are `[u32 len][u8 type][payload]`, with protocol version 1 in `Hello`.
+  - Message types: Hello, Lobby, Song (header) and Chunk, Loaded, Ping and Pong, Start, Input,
+    Snap, End, Bye.
+  - Each connection has a reader thread and a writer thread; the game thread uses only
+    channels.
+  - Clock offset comes from the lowest-RTT sample of the last 8 pings (4 Hz keep-alive), and a
+    3 s silence means disconnect.
+  - Host-authoritative: the host steps `Rally` and sends 60 Hz snapshots. The client sends
+    60 Hz inputs (swings as a press counter), draws one snapshot behind (interpolated) and
+    predicts its own avatar with `Rally::predict_move`, replaying inputs the host hasn't acked.
+  - Both PCs analyse the same file and start `play_ex` at the agreed instant.
+  - Test flags: `--lan-host FILE`, `--lan-join IP`, `--rally-bot` (+ `--selftest DIR` → `lan.log`).
+  - TCP connects (even to 127.0.0.1) are blocked inside the agent sandbox here (WSAEACCES).
+    That's why `net.rs` tests run the full session over an in-memory duplex, and the TCP test
+    is `#[ignore]`. Run the two-instance check outside the sandbox.
+- `main.rs`, `net.rs`, `rally.rs`, `render.rs` are CRLF. Git Bash `sed -i` silently converts a
+  CRLF file to LF; use the Edit tool or `perl -pi`, then check with `file`.
 
 ## Source map
 `main.rs` app flow / menu / jukebox / settings / CLI · `analysis.rs` DSP (offline +

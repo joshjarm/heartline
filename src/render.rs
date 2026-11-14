@@ -16,6 +16,86 @@ use std::f32::consts::{PI, TAU};
 use crate::analysis::{SectionKind, N_SPEC};
 use crate::game::*;
 use crate::level::*;
+use crate::rally::{self, Character, FxKind, OrbState, Power, Rally, AVATAR_R, GOAL_HALF, ORB_R, SWING_ACTIVE, SWING_HALF, SWING_R, ZONE_W};
+
+// ---------------------------------------------------------------------------------------------
+// Music pulse layer: instant-attack / exponential-decay envelopes per instrument, kept separate
+// from the smoothed spectrum. Every amplitude below is multiplied by `Renderer::fx` (menu
+// VISUALS: FULL 1.0 / SUBTLE 0.45 / OFF 0). "Global" ones (camera, exposure, bloom, aberration)
+// are also damped when the screen is full of bullets.
+// ---------------------------------------------------------------------------------------------
+
+// kick: the whole frame punches
+const KICK_TAU: f32 = 0.18; // s, punch decay time constant
+const KICK_ZOOM: f32 = 0.022; // camera zoom-in per kick (fraction)
+const KICK_EXPO: f32 = 0.07; // composite exposure bump (photosensitivity: keep <= 0.15)
+const KICK_BLOOM: f32 = 0.22; // bloom gain bump
+const KICK_BG: f32 = 0.30; // background shader brightness bump
+const KICK_GRID: f32 = 0.06; // floor grid alpha flash
+const RIPPLE_R0: f32 = 170.0; // px: ripple starts at the crown so it is not hidden by the Heart
+const RIPPLE_SPEED: f32 = 1700.0; // px/s: grid ripple travelling outward from the Heart
+const RIPPLE_W: f32 = 95.0; // px, ripple band half-width
+const RIPPLE_MAX: f32 = 0.7; // per-vertex alpha cap (overlapping ripples)
+const RIPPLE_A: f32 = 1.1; // ripple alpha added to floor grid lines
+const RIPPLE_LIFE: f32 = 0.75; // s
+const RIPPLE_BG: f32 = 2.2; // deep (background) grid brightening under the ripple
+const LUMA_GAP: f32 = 0.34; // s: full-frame luminance bumps scale down if kicks come faster (<= ~3/s)
+// snare: a thin ring off the Heart + a rim / chroma crack
+const SNARE_TAU: f32 = 0.11;
+const SNARE_RINGS: usize = 4;
+const SNARE_R0: f32 = 110.0; // px, ring start radius
+const SNARE_SPEED: f32 = 1250.0; // px/s
+const SNARE_LIFE: f32 = 0.5; // s
+const SNARE_A: f32 = 0.55; // ring alpha
+const SNARE_W: f32 = 2.0; // px, ring width (thin, cool: never reads as a hot shockwave)
+const SNARE_ABERR: f32 = 0.30; // chromatic aberration spike
+const SNARE_RIM: f32 = 0.45; // rim heartline brightness flash
+// hats: small fast shimmer
+const HAT_TAU: f32 = 0.07;
+const HAT_SPARK_A: f32 = 0.6; // grid-intersection sparkle alpha
+const HAT_SPARK_L: f32 = 7.0; // px, sparkle arm length
+const HAT_SPARK_FRAC: f32 = 0.3; // share of intersections lit per hat
+const HAT_RIDGE: f32 = 0.5; // live ridgeline alpha shimmer
+const HAT_JIT: f32 = 5.0; // px, live ridgeline jitter
+// sustained bass: slow breathing
+const BASS_RISE: f32 = 2.5; // 1/s
+const BASS_FALL: f32 = 1.1; // 1/s
+const BASS_ZOOM: f32 = 0.010; // camera breathing
+const BASS_PLAT: f32 = 0.6; // platform underside depth breathing
+// crowd control
+const BUSY_BULLETS: f32 = 140.0; // bullet count at which global effects are damped the most
+const BUSY_DAMP: f32 = 0.6; // max damping of global effects
+// oscilloscope ring around the Heart (the actual waveform at the audible position)
+pub const SCOPE_N: usize = 512; // points kept per frame
+const SCOPE_DECIM: usize = 2; // source frames per point (512 x 2 = ~23 ms at 44.1 kHz)
+const SCOPE_PTS: usize = 256; // drawn vertices
+const SCOPE_TRIG: usize = 384; // source frames searched for the zero-crossing trigger (~9 ms)
+const SCOPE_AGC_UP: f32 = 40.0; // 1/s, auto-gain attack
+const SCOPE_AGC_DN: f32 = 3.5; // 1/s, auto-gain release
+const SCOPE_R: f32 = 208.0; // px, base radius (inside the crown's history rings)
+const SCOPE_AMP: f32 = 34.0; // px at full auto-gained level
+const SCOPE_KICK: f32 = 30.0; // px, kick pushes the ring outward
+const SCOPE_A: f32 = 0.6;
+const SCOPE_W: f32 = 2.2;
+const SCOPE_Z: f32 = 14.0; // floats slightly above the floor
+const SCOPE_TENSE: f32 = 0.28; // ring contracts by this fraction during a build-up
+const BEAT_STEP: f32 = TAU / 16.0; // phase-locked ring rotation per beat
+// anticipation (file mode): tension over the bars before a drop, released on its downbeat
+const BUILD_BARS: f32 = 4.0;
+const BUILD_MIN: f32 = 3.0; // s
+const BUILD_MAX: f32 = 10.0; // s
+const TENSION_VIG: f32 = 0.7; // vignette tightening
+const TENSION_DESAT: f32 = 0.65; // background desaturation
+const TENSION_ZOOM: f32 = 0.03; // slow camera creep-in
+const TENSION_RIDGE: f32 = 0.9; // ridgeline stretch
+const TENSION_SCROLL: f32 = 7.0; // deep grid rushes (x base speed)
+const TENSION_GRID: f32 = 0.05; // deep grid brightening
+const DROP_TAU: f32 = 0.55; // s, release decay
+const DROP_FLASH: f32 = 0.10; // one colour flash (not white)
+const DROP_ZOOM: f32 = 0.045; // camera snaps out
+const DROP_BLOOM: f32 = 0.4;
+const DROP_SAT: f32 = 0.6; // background saturation boost
+const DROP_ABERR: f32 = 0.6;
 
 // ---------------------------------------------------------------------------------------------
 // Palettes
@@ -871,6 +951,9 @@ uniform float u_bass;
 uniform float u_scroll;
 uniform float u_lv;
 uniform float u_warp;
+uniform float u_kick;
+uniform vec3 u_ripple;
+uniform vec3 u_pump;
 uniform vec2 u_cam;
 uniform vec2 u_arena;
 uniform vec3 u_vista;
@@ -917,7 +1000,10 @@ vec3 topdown(vec2 q) {
     vec2 g = abs(fract(gp / 192.0 + 0.5) - 0.5) * 192.0;
     float ln = 1.0 - smoothstep(0.4 * px, 1.7 * px, min(g.x, g.y));
     float fog = exp(-length(q - u_cam) * 0.0011);
-    col += u_grid * ln * (0.03 + 0.03 * u_swell + 0.25 * u_warp) * fog;
+    col += u_grid * ln * (0.03 + 0.03 * u_swell + 0.25 * u_warp + u_pump.z) * fog;
+    // kick ripple: a band of brighter grid travelling outward from the Heart
+    float rd = (length(q) - u_ripple.x) / u_ripple.z;
+    col += u_grid * ln * u_ripple.y * exp(-rd * rd) * fog;
     // platform glass: the arena floor dims what is below it
     vec2 a = abs(q) - u_arena;
     float inside = 1.0 - smoothstep(-1.0, 1.0, max(a.x, a.y));
@@ -969,6 +1055,10 @@ void main() {
         float st = step(0.55, h) * smoothstep(0.12, 0.02, w) * smoothstep(0.0, 0.03, s) * smoothstep(0.4, 0.0, s) * smoothstep(0.05, 0.45, r);
         col += mix(u_grid, vec3(1.0), 0.4) * st * u_warp * 0.55;
     }
+    // music pump: build-up desaturates (x), the drop over-saturates (y), kicks brighten
+    float l = dot(col, vec3(0.299, 0.587, 0.114));
+    col = max(mix(vec3(l), col, 1.0 - u_pump.x + u_pump.y), 0.0);
+    col *= 1.0 + u_kick;
     gl_FragColor = vec4(col, 1.0);
 }
 "#;
@@ -1010,6 +1100,8 @@ uniform float u_flash;
 uniform vec3 u_flashcol;
 uniform float u_bloom;
 uniform float u_warp;
+uniform float u_expo;
+uniform float u_vig;
 
 vec3 scene(vec2 p, vec2 off) {
     return vec3(texture2D(Texture, p + off).r, texture2D(Texture, p).g, texture2D(Texture, p - off).b);
@@ -1028,11 +1120,12 @@ void main() {
     vec3 b2 = texture2D(Bloom2, uv).rgb;
     col += (b1 * 0.6 + b2 * 0.85) * u_bloom;
     // soft shoulder so stacked glow never clips harshly
+    col *= u_expo;
     col = col / (1.0 + max(col - 1.0, 0.0) * 0.6);
     float scan = 0.96 + 0.04 * sin(uv.y * u_res.y * 3.14159);
     col *= scan;
-    float vig = smoothstep(1.05, 0.3, sqrt(r2) * 1.3);
-    col *= mix(0.55, 1.0, vig);
+    float vig = smoothstep(1.05 - 0.3 * u_vig, 0.3 - 0.12 * u_vig, sqrt(r2) * 1.3);
+    col *= mix(0.55 - 0.2 * u_vig, 1.0, vig);
     col += u_flashcol * u_flash;
     float n = fract(sin(dot(uv * u_res + u_time, vec2(12.9898, 78.233))) * 43758.5453);
     col += (n - 0.5) * 0.02;
@@ -1140,6 +1233,29 @@ pub struct Renderer {
     heart_from: (Edges, Edges),
     heart_mt: f32,
     broken_t: f32,
+    // pulse layer (see the consts at the top)
+    /// Reactive amplitude scale from the VISUALS setting (1 / 0.45 / 0).
+    pub fx: f32,
+    kick: f32,
+    kick_luma: f32,
+    last_kick: f32,
+    ripples: [(f32, f32); 4],
+    ripple_i: usize,
+    snare: f32,
+    rings: [(f32, f32); SNARE_RINGS],
+    ring_i: usize,
+    hat: f32,
+    hat_n: u32,
+    bass_b: f32,
+    busy: f32,
+    scope: [f32; SCOPE_N],
+    scope_ok: bool,
+    scope_peak: f32,
+    next_big: f32,
+    tension: f32,
+    tension_pk: f32,
+    drop: f32,
+    prev_section: (u16, SectionKind),
 }
 
 fn auto_ss(forced: Option<u32>, pw: u32, ph: u32) -> u32 {
@@ -1180,6 +1296,9 @@ impl Renderer {
                 ("u_scroll", UniformType::Float1),
                 ("u_lv", UniformType::Float1),
                 ("u_warp", UniformType::Float1),
+                ("u_kick", UniformType::Float1),
+                ("u_ripple", UniformType::Float3),
+                ("u_pump", UniformType::Float3),
                 ("u_cam", UniformType::Float2),
                 ("u_arena", UniformType::Float2),
                 ("u_vista", UniformType::Float3),
@@ -1203,6 +1322,8 @@ impl Renderer {
                 ("u_flashcol", UniformType::Float3),
                 ("u_bloom", UniformType::Float1),
                 ("u_warp", UniformType::Float1),
+                ("u_expo", UniformType::Float1),
+                ("u_vig", UniformType::Float1),
             ],
             &["Bloom1", "Bloom2"],
             PipelineParams::default(),
@@ -1267,6 +1388,27 @@ impl Renderer {
             heart_from,
             heart_mt: 1.0,
             broken_t: 0.0,
+            fx: 1.0,
+            kick: 0.0,
+            kick_luma: 1.0,
+            last_kick: -10.0,
+            ripples: [(-10.0, 0.0); 4],
+            ripple_i: 0,
+            snare: 0.0,
+            rings: [(-10.0, 0.0); SNARE_RINGS],
+            ring_i: 0,
+            hat: 0.0,
+            hat_n: 0,
+            bass_b: 0.0,
+            busy: 0.0,
+            scope: [0.0; SCOPE_N],
+            scope_ok: false,
+            scope_peak: 0.2,
+            next_big: f32::INFINITY,
+            tension: 0.0,
+            tension_pk: 0.0,
+            drop: 0.0,
+            prev_section: (u16::MAX, SectionKind::Normal),
         };
         r.bind_bloom();
         r
@@ -1312,8 +1454,62 @@ impl Renderer {
         let sh_amp = world.shake * world.shake * 16.0;
         let t = self.time * 47.0;
         let shake = vec2((t * 1.3).sin() + (t * 2.9).cos(), (t * 1.7).cos() + (t * 3.1).sin()) * sh_amp * 0.5;
-        self.view = View { sw, sh, scale, center: self.cam_s + shake };
+        // music pulse: kick punch-in, bass breathing, build-up creep-in, drop snap-out
+        let zoom = 1.0 + self.fx * (KICK_ZOOM * self.kick * self.glob() + BASS_ZOOM * self.bass_b + TENSION_ZOOM * self.tension - DROP_ZOOM * self.drop);
+        self.view = View { sw, sh, scale: scale * zoom, center: self.cam_s + shake };
         self.view
+    }
+
+    /// Damping for full-frame effects when the screen is busy with bullets (1 = none).
+    #[inline]
+    fn glob(&self) -> f32 {
+        1.0 - BUSY_DAMP * self.busy
+    }
+
+    /// This frame's audible waveform (interleaved stereo `samples` at `sr`, window starting at
+    /// `t`) and the seconds until the next build-up target. `None` (live mode) hides the scope.
+    /// Copies into a fixed buffer: no allocation.
+    pub fn feed_signal(&mut self, track: Option<(&[f32], u32)>, t: f32, next_big: f32) {
+        self.next_big = next_big;
+        let Some((s, sr)) = track else {
+            self.scope_ok = false;
+            return;
+        };
+        let span = SCOPE_N * SCOPE_DECIM;
+        let frames = s.len() / 2;
+        let start = (t.max(0.0) * sr as f32) as usize;
+        if start + span * 2 >= frames {
+            self.scope_ok = false;
+            return;
+        }
+        let mono = |i: usize| (s[2 * i] + s[2 * i + 1]) * 0.5;
+        // trigger on the first rising zero crossing (of a lightly smoothed signal) so the trace
+        // holds still like an oscilloscope instead of sliding every frame
+        let mut st = start;
+        let mut prev = mono(start);
+        for i in start + 1..start + SCOPE_TRIG {
+            let v = prev * 0.6 + mono(i) * 0.4;
+            if prev <= 0.0 && v > 0.0 {
+                st = i;
+                break;
+            }
+            prev = v;
+        }
+        let mut peak = 0.0f32;
+        for k in 0..SCOPE_N {
+            let mut a = 0.0;
+            for j in 0..SCOPE_DECIM {
+                a += mono(st + k * SCOPE_DECIM + j);
+            }
+            let v = a / SCOPE_DECIM as f32;
+            self.scope[k] = v;
+            peak = peak.max(v.abs());
+        }
+        // auto-gain: fast up, quicker-than-the-music down, so the line stays alive after a big hit
+        let dt = get_frame_time().clamp(0.0, 0.1);
+        let rate = if peak > self.scope_peak { SCOPE_AGC_UP } else { SCOPE_AGC_DN };
+        self.scope_peak += (peak - self.scope_peak) * (1.0 - (-dt * rate).exp());
+        self.scope_ok = true;
     }
 
     /// 2.5D projection: world point `p` at height `z` -> position on the z = 0 drawing plane.
@@ -1389,6 +1585,57 @@ impl Renderer {
             self.hist[self.hist_head] = self.spec_s;
         }
 
+        // ---- pulse layer: instant attack, exponential decay ----
+        self.kick *= (-dt / KICK_TAU).exp();
+        self.snare *= (-dt / SNARE_TAU).exp();
+        self.hat *= (-dt / HAT_TAU).exp();
+        self.drop *= (-dt / DROP_TAU).exp();
+        let bl = w.feat.low.min(1.2);
+        let br = if bl > self.bass_b { BASS_RISE } else { BASS_FALL };
+        self.bass_b += (bl - self.bass_b) * (1.0 - (-dt * br).exp());
+        self.busy = (w.bullets.len() as f32 / BUSY_BULLETS).min(1.0);
+        for b in 0..3 {
+            if w.hit[b] > self.prev_hit[b] + 0.2 {
+                let a = w.hit[b];
+                match b {
+                    0 => {
+                        self.kick = self.kick.max(a);
+                        // photosensitivity: luminance bumps shrink when kicks come faster than ~3/s
+                        self.kick_luma = ((self.clock - self.last_kick) / LUMA_GAP).clamp(0.25, 1.0);
+                        self.last_kick = self.clock;
+                        self.ripples[self.ripple_i] = (self.clock, a);
+                        self.ripple_i = (self.ripple_i + 1) % self.ripples.len();
+                    }
+                    1 => {
+                        self.snare = self.snare.max(a);
+                        self.rings[self.ring_i] = (self.clock, a);
+                        self.ring_i = (self.ring_i + 1) % SNARE_RINGS;
+                    }
+                    _ => {
+                        self.hat = self.hat.max(a);
+                        self.hat_n = self.hat_n.wrapping_add(1);
+                    }
+                }
+            }
+        }
+        // anticipation: tension over the last bars before a step up into Intense / Drop
+        let win = (BUILD_BARS * 4.0 * w.beat_len).clamp(BUILD_MIN, BUILD_MAX);
+        let tt = (1.0 - self.next_big / win).clamp(0.0, 1.0);
+        self.tension = tt * tt;
+        self.tension_pk = if tt > 0.0 { self.tension_pk.max(self.tension) } else { self.tension_pk };
+        let sec = (w.section_idx, w.section_kind);
+        if sec.0 != self.prev_section.0 {
+            let big = |k: SectionKind| matches!(k, SectionKind::Intense | SectionKind::Drop);
+            if big(sec.1) && !big(self.prev_section.1) && self.prev_section.0 != u16::MAX {
+                // the release: one big hit on the downbeat
+                self.drop = 0.6 + 0.4 * self.tension_pk;
+                self.kick = 1.0;
+                self.kick_luma = 1.0;
+            }
+            self.tension_pk = 0.0;
+            self.prev_section = sec;
+        }
+
         // heartline: kicks are full beats, snares half beats; a resting pulse in silence
         for b in 0..3 {
             if w.hit[b] > self.prev_hit[b] + 0.2 {
@@ -1421,7 +1668,7 @@ impl Renderer {
         }
 
         self.scroll += dt * VISTA_SCROLL * (1.0 + 1.2 * w.hit[0] + 4.0 * w.warp);
-        self.deep_scroll += dt * (DEEP_SCROLL + WARP_SCROLL * w.warp * w.warp);
+        self.deep_scroll += dt * (DEEP_SCROLL * (1.0 + TENSION_SCROLL * self.tension * self.fx) + WARP_SCROLL * w.warp * w.warp);
         if w.bar_pulse > 0.8 && self.prev_bar <= 0.8 {
             self.bar_count += 1;
         }
@@ -1467,6 +1714,18 @@ impl Renderer {
 
     /// Draw the whole scene (background, world, drift visuals) and post-process it to the screen.
     pub fn draw_scene(&mut self, world: &World, dt: f32, idle: f32, progress: f32) {
+        self.scene_pass(world, dt, idle, progress, None);
+    }
+
+    /// Rally mode: the same scene and music layer (`music` has no enemies or bullets), with the
+    /// Rally avatars, orbs and end-line ridges in place of the combat entities, then the score HUD.
+    /// `me` is the local player (0 = host / left).
+    pub fn draw_rally(&mut self, r: &Rally, music: &World, me: usize, dt: f32) {
+        self.scene_pass(music, dt, 0.0, 0.0, Some((r, me & 1)));
+        self.draw_rally_hud(r, me & 1);
+    }
+
+    fn scene_pass(&mut self, world: &World, dt: f32, idle: f32, progress: f32, rally: Option<(&Rally, usize)>) {
         self.resize_if_needed();
         self.time += dt;
         if self.pal_t < 1.0 {
@@ -1500,6 +1759,13 @@ impl Renderer {
         m.set_uniform("u_scroll", self.deep_scroll);
         m.set_uniform("u_lv", lv);
         m.set_uniform("u_warp", world.warp);
+        let (fx, g) = (self.fx, self.glob());
+        m.set_uniform("u_kick", KICK_BG * self.kick * self.kick_luma * fx * g);
+        let (rt0, ra) = self.ripples[(self.ripple_i + self.ripples.len() - 1) % self.ripples.len()];
+        let rage = self.clock - rt0;
+        let rfade = (1.0 - rage / RIPPLE_LIFE).max(0.0);
+        m.set_uniform("u_ripple", vec3(RIPPLE_R0 + rage * RIPPLE_SPEED,RIPPLE_BG * 0.03 * ra * rfade * fx, RIPPLE_W * 1.6));
+        m.set_uniform("u_pump", vec3(TENSION_DESAT * self.tension * fx, DROP_SAT * self.drop * fx, TENSION_GRID * self.tension * fx));
         m.set_uniform("u_cam", view.center);
         m.set_uniform("u_arena", vec2(HALF_W, HALF_H));
         m.set_uniform("u_vista", vec3(HZ, SUN_Y, SUN_R));
@@ -1537,28 +1803,33 @@ impl Renderer {
         self.draw_rim(world, e);
         if lv > 0.003 {
             self.draw_crown(world, lv);
+            self.draw_scope(world, lv);
         }
         gl_use_default_material();
-        if lv > 0.003 {
+        if lv > 0.003 && rally.is_none() {
             self.draw_tiles(world, lv, armed_k);
             self.draw_hazards(world, lv);
         }
         gl_use_material(&self.add_mat);
         self.draw_heart(world, e, progress);
         gl_use_default_material();
-        if lv > 0.003 {
+        if let Some((r, me)) = rally {
+            self.draw_rally_world(r, world, me, tscale);
+        } else if lv > 0.003 {
             self.draw_heart_rings(world, lv, progress);
             for p in &world.pulses {
                 self.draw_pulse(world, p, lv);
             }
         }
-        self.draw_pickups(world, tscale);
-        if lv > 0.003 {
-            self.draw_enemies(world, lv);
-            self.draw_bullets(world, lv);
+        if rally.is_none() {
+            self.draw_pickups(world, tscale);
+            if lv > 0.003 {
+                self.draw_enemies(world, lv);
+                self.draw_bullets(world, lv);
+            }
+            self.draw_shots(world);
+            self.draw_player(world);
         }
-        self.draw_shots(world);
-        self.draw_player(world);
         gl_use_material(&self.add_mat);
         self.draw_particles(world);
         gl_use_default_material();
@@ -1578,11 +1849,15 @@ impl Renderer {
         let c = &self.comp_mat;
         c.set_uniform("u_res", vec2(self.pw as f32, self.ph as f32));
         c.set_uniform("u_time", self.time);
-        c.set_uniform("u_aberr", (world.beat_pulse * 0.12 + world.shake * 0.9 + world.flash * 0.6).min(1.5) * (1.0 - idle * 0.7));
-        c.set_uniform("u_flash", world.flash * 0.5 + world.warp * world.warp * 0.12);
+        let pulse_ab = fx * g * (SNARE_ABERR * self.snare + DROP_ABERR * self.drop);
+        c.set_uniform("u_aberr", (world.beat_pulse * 0.12 + world.shake * 0.9 + world.flash * 0.6 + pulse_ab).min(1.5) * (1.0 - idle * 0.7));
+        c.set_uniform("u_flash", world.flash * 0.5 + world.warp * world.warp * 0.12 + DROP_FLASH * self.drop * self.drop * fx * g);
         c.set_uniform("u_flashcol", v3(mixc(pal.secondary, WHITE, 0.5)));
-        c.set_uniform("u_bloom", (1.0 + 0.15 * self.swell) * (1.0 - 0.35 * e));
+        let pulse_bl = fx * g * (KICK_BLOOM * self.kick + DROP_BLOOM * self.drop);
+        c.set_uniform("u_bloom", (1.0 + 0.15 * self.swell + pulse_bl) * (1.0 - 0.35 * e));
         c.set_uniform("u_warp", world.warp);
+        c.set_uniform("u_expo", 1.0 + KICK_EXPO * self.kick * self.kick_luma * fx * g);
+        c.set_uniform("u_vig", TENSION_VIG * self.tension * fx);
         gl_use_material(c);
         draw_texture_ex(
             &self.scene.texture,
@@ -1602,7 +1877,7 @@ impl Renderer {
     fn draw_floor(&self, w: &World, e: f32, armed_k: f32) {
         let pal = &self.pal;
         let lv = 1.0 - e;
-        let ga = (FLOOR_A + FLOOR_ARMED_A * armed_k + FLOOR_SWELL_A * self.swell) * lv;
+        let ga = (FLOOR_A + FLOOR_ARMED_A * armed_k + FLOOR_SWELL_A * self.swell + KICK_GRID * self.kick * self.fx) * lv;
         let va = VISTA_GRID_A * (1.0 + 0.5 * w.hit[0]) * e;
         let gw = 1.6 + 1.2 * e;
         let vp = self.vs(0.5, HZ);
@@ -1625,16 +1900,98 @@ impl Renderer {
             let p1 = vec2(HALF_W, y).lerp(self.vs(0.5 + hs, fy), e);
             line(p0, p1, gw, alpha(pal.grid, ga + va * fade));
         }
-        // platform underside: a dim second rim below the floor + corner struts
+        if lv > 0.01 && self.fx > 0.0 {
+            self.draw_floor_pulse(lv);
+        }
+        // platform underside: a dim second rim below the floor + corner struts (breathes with bass)
         if lv > 0.01 {
             let a = 0.16 * lv;
+            let pd = PLAT_D * (1.0 + BASS_PLAT * self.bass_b * self.fx);
             let c = [vec2(-HALF_W, -HALF_H), vec2(HALF_W, -HALF_H), vec2(HALF_W, HALF_H), vec2(-HALF_W, HALF_H)];
             for k in 0..4 {
                 let (p, q) = (c[k], c[(k + 1) % 4]);
-                line(self.pj(p, -PLAT_D), self.pj(q, -PLAT_D), 2.0, alpha(pal.grid, a));
-                line(self.pj(p, -PLAT_D * 2.2), self.pj(q, -PLAT_D * 2.2), 1.5, alpha(pal.grid, a * 0.4));
-                seg(self.pj(p, 0.0), self.pj(p, -PLAT_D * 2.2), 2.0, alpha(pal.primary, a * 1.6), alpha(pal.grid, 0.0));
+                line(self.pj(p, -pd), self.pj(q, -pd), 2.0, alpha(pal.grid, a));
+                line(self.pj(p, -pd * 2.2), self.pj(q, -pd * 2.2), 1.5, alpha(pal.grid, a * 0.4));
+                seg(self.pj(p, 0.0), self.pj(p, -pd * 2.2), 2.0, alpha(pal.primary, a * 1.6), alpha(pal.grid, 0.0));
             }
+        }
+    }
+
+    /// Floor-level music pulse (additive, z = 0, under every threat): kick ripples running out
+    /// along the grid lines from the Heart, hat sparkles on intersections, thin snare rings.
+    fn draw_floor_pulse(&self, lv: f32) {
+        let pal = &self.pal;
+        let fx = self.fx;
+        const NX: usize = COLS + 1;
+        const NY: usize = ROWS + 1;
+        // per-vertex ripple intensity (stack array, no allocation)
+        let mut rip = [0.0f32; NX * NY];
+        let mut any = false;
+        for &(t0, amp) in &self.ripples {
+            let age = self.clock - t0;
+            if age < 0.0 || age > RIPPLE_LIFE {
+                continue;
+            }
+            any = true;
+            let r = RIPPLE_R0 + age * RIPPLE_SPEED;
+            let a = amp * (1.0 - age / RIPPLE_LIFE) * RIPPLE_A * fx * self.glob() * lv;
+            for j in 0..NY {
+                for i in 0..NX {
+                    let p = vec2(-HALF_W + i as f32 * TILE, -HALF_H + j as f32 * TILE);
+                    let d = (p.length() - r) / RIPPLE_W;
+                    rip[j * NX + i] += a * (-d * d).exp();
+                }
+            }
+        }
+        if any {
+            let col = mixc(pal.grid, WHITE, 0.3);
+            let vp = |i: usize, j: usize| vec2(-HALF_W + i as f32 * TILE, -HALF_H + j as f32 * TILE);
+            for j in 0..NY {
+                for i in 0..NX {
+                    let a0 = rip[j * NX + i].min(RIPPLE_MAX);
+                    if i + 1 < NX {
+                        let a1 = rip[j * NX + i + 1].min(RIPPLE_MAX);
+                        if a0 + a1 > 0.01 {
+                            seg(vp(i, j), vp(i + 1, j), 2.2, alpha(col, a0), alpha(col, a1));
+                        }
+                    }
+                    if j + 1 < NY {
+                        let a1 = rip[(j + 1) * NX + i].min(RIPPLE_MAX);
+                        if a0 + a1 > 0.01 {
+                            seg(vp(i, j), vp(i, j + 1), 2.2, alpha(col, a0), alpha(col, a1));
+                        }
+                    }
+                }
+            }
+        }
+        // hats: a fresh random subset of intersections glints on each hat
+        let ha = self.hat * HAT_SPARK_A * fx * lv;
+        if ha > 0.01 {
+            let col = mixc(pal.primary, WHITE, 0.5);
+            let seed = self.hat_n as f32 * 7.31;
+            for j in 0..NY {
+                for i in 0..NX {
+                    let h = ((i as f32 * 12.9898 + j as f32 * 78.233 + seed).sin() * 43758.547).fract().abs();
+                    if h < HAT_SPARK_FRAC {
+                        let p = vec2(-HALF_W + i as f32 * TILE, -HALF_H + j as f32 * TILE);
+                        let l = HAT_SPARK_L * (0.6 + h / HAT_SPARK_FRAC * 0.6);
+                        line(p - vec2(l, 0.0), p + vec2(l, 0.0), 1.6, alpha(col, ha));
+                        line(p - vec2(0.0, l), p + vec2(0.0, l), 1.6, alpha(col, ha));
+                    }
+                }
+            }
+        }
+        // snares: thin cool rings expanding off the Heart
+        let col = mixc(pal.grid, WHITE, 0.4);
+        for &(t0, amp) in &self.rings {
+            let age = self.clock - t0;
+            if age < 0.0 || age > SNARE_LIFE {
+                continue;
+            }
+            let k = age / SNARE_LIFE;
+            let r = SNARE_R0 + age * SNARE_SPEED * (1.0 - 0.35 * k);
+            let a = amp * (1.0 - k) * (1.0 - k) * SNARE_A * fx * lv;
+            arc(Vec2::ZERO, r, 0.0, TAU, SNARE_W, alpha(col, a));
         }
     }
 
@@ -1643,7 +2000,7 @@ impl Renderer {
     fn draw_rim(&self, w: &World, e: f32) {
         let pal = &self.pal;
         let lv = 1.0 - e;
-        let bright = 0.65 + 0.35 * w.bar_pulse * lv;
+        let bright = 0.65 + (0.35 * w.bar_pulse + SNARE_RIM * self.snare * self.fx) * lv;
         let mut prev = Vec2::ZERO;
         for i in 0..=P {
             let v = self.ecg_at(i);
@@ -1683,7 +2040,11 @@ impl Renderer {
         for m in (0..RIDGES).rev() {
             let (spec, d) = self.layer(m);
             let ff = (d / RIDGES as f32).min(1.0);
-            let ga = RIDGE_A * (1.0 - ff).powf(1.4) * (1.0 + if m == 0 { 0.4 * w.hit[0] } else { 0.0 });
+            let live = if m == 0 { 1.0 } else { 0.0 };
+            let ga = RIDGE_A * (1.0 - ff).powf(1.4) * (1.0 + live * (0.4 * w.hit[0] + HAT_RIDGE * self.hat * self.fx));
+            // build-up: ridges stretch outward; hats make the live ridge shimmer
+            let stretch = 1.0 + TENSION_RIDGE * self.tension * self.fx * lv;
+            let jit = live * HAT_JIT * self.hat * self.fx * lv;
             let va = 0.9 * (1.0 - ff * 0.75);
             let col = mixc(mixc(pal.secondary, pal.grid, ff), pal.accent, if m == 0 { 0.4 * w.hit[1] } else { 0.0 });
             let a = ga * lv + va * e;
@@ -1696,7 +2057,8 @@ impl Renderer {
             for i in 0..=P {
                 let v = band(spec, perim_band(i));
                 let (pos, n) = perim(i);
-                let gp = pos + n * (RIM_OFF + RIDGE_BASE + d * RIDGE_GAP + v * RIDGE_AMP * (1.0 - 0.04 * d));
+                let sh = if jit > 0.0 { jit * (i as f32 * 2.37 + self.clock * 83.0).sin() } else { 0.0 };
+                let gp = pos + n * (RIM_OFF + RIDGE_BASE + (d * RIDGE_GAP + v * RIDGE_AMP * (1.0 - 0.04 * d)) * stretch + sh);
                 let fx = 0.5 + (i as f32 / P as f32 - 0.5) * wsc;
                 let xf = i as f32 / P as f32;
                 let taper = smooth(0.0, 0.07, xf) * smooth(1.0, 0.93, xf);
@@ -1739,6 +2101,46 @@ impl Renderer {
                 }
                 prev = p;
             }
+        }
+    }
+
+    /// Oscilloscope ring: the actual audible waveform wrapped into a closed loop around the Heart.
+    /// Kicks push it outward, build-ups pull it in, and it steps round on every beat.
+    fn draw_scope(&self, w: &World, lv: f32) {
+        if !self.scope_ok || self.fx <= 0.0 || w.heart.broken {
+            return;
+        }
+        let pal = &self.pal;
+        let fx = self.fx;
+        let a = SCOPE_A * lv * fx.sqrt();
+        if a < 0.004 {
+            return;
+        }
+        let gain = 1.0 / self.scope_peak.max(0.12);
+        let r0 = SCOPE_R * (1.0 - SCOPE_TENSE * self.tension * fx) + (SCOPE_KICK * self.kick + 10.0 * self.bass_b) * fx;
+        // phase-locked rotation: snaps forward right after each beat, then holds
+        let step = 1.0 - (1.0 - w.beat_phase.clamp(0.0, 1.0)).powi(4);
+        let rot = (w.beat_count as f32 % 16.0 + step) * BEAT_STEP - PI * 0.5;
+        let col = mixc(pal.primary, WHITE, 0.15 + 0.35 * self.kick * fx);
+        let glow = alpha(pal.primary, a * 0.14);
+        let stride = SCOPE_N / SCOPE_PTS;
+        let mut prev = Vec2::ZERO;
+        let mut first = Vec2::ZERO;
+        for s in 0..=SCOPE_PTS {
+            let k = s % SCOPE_PTS;
+            let f = k as f32 / SCOPE_PTS as f32;
+            // taper the ends to zero so the loop closes without a seam
+            let win = smooth(0.0, 0.06, f) * smooth(1.0, 0.94, f);
+            let v = (self.scope[k * stride] * gain).clamp(-1.6, 1.6) * win * fx.sqrt();
+            let ang = rot + f * TAU;
+            let p = if s == SCOPE_PTS { first } else { self.pj(dir(ang) * (r0 + v * SCOPE_AMP), SCOPE_Z + v.abs() * 6.0) };
+            if s == 0 {
+                first = p;
+            } else {
+                line(prev, p, SCOPE_W * 3.5, glow);
+                line(prev, p, SCOPE_W, alpha(col, a));
+            }
+            prev = p;
         }
     }
 
@@ -2341,6 +2743,232 @@ impl Renderer {
     }
 
     // -----------------------------------------------------------------------------------------
+    // Rally (LAN paddle duel): drawn where the combat entities normally go
+    // -----------------------------------------------------------------------------------------
+
+    /// End lines as ridgelines that rise toward each incoming orb's landing point, landing
+    /// telegraphs, avatars with swing arcs and mini spectra, waveform orb trails, hit flashes.
+    fn draw_rally_world(&self, r: &Rally, w: &World, me: usize, tscale: f32) {
+        let pal = self.pal;
+        let t = r.t;
+        let cols = [rally_col(r.players[0].ch), rally_col(r.players[1].ch)];
+        let flying = |i: usize| r.orbs.iter().filter(move |o| o.state == OrbState::Flying && o.target() == i);
+
+        // ---- field: zone boundaries + end-line ridges (additive) ----
+        gl_use_material(&self.add_mat);
+        for (i, &col) in cols.iter().enumerate() {
+            let x = rally::end_x(i) + rally::fwd(i) * ZONE_W;
+            let n = 18;
+            for k in 0..n {
+                let y0 = -HALF_H + (k as f32 + 0.25) * 2.0 * HALF_H / n as f32;
+                line(vec2(x, y0), vec2(x, y0 + HALF_H / n as f32), 1.4, alpha(col, 0.16));
+            }
+            let ex = rally::end_x(i);
+            let heat = flying(i).map(|o| o.progress(t)).fold(0.0f32, f32::max);
+            let mut prev = Vec2::ZERO;
+            for s in 0..=RALLY_RIDGE_PTS {
+                let f = s as f32 / RALLY_RIDGE_PTS as f32;
+                let y = -HALF_H + 2.0 * HALF_H * f;
+                let mut z = band(&self.spec_s, (f - 0.5).abs() * 2.0) * RALLY_RIDGE_SPEC * (1.0 + 0.6 * w.hit[0]);
+                for o in flying(i) {
+                    let k = o.progress(t);
+                    let g = (y - o.land) / RALLY_RIDGE_SIG;
+                    z += RALLY_RIDGE_H * k * k * (-g * g).exp();
+                }
+                let goal = y.abs() <= r.goal_half;
+                let col = if goal { mixc(col, WHITE, 0.2 + 0.5 * heat * heat) } else { pal.grid };
+                let p = self.pj(vec2(ex, y), z);
+                if s > 0 {
+                    line(prev, p, if goal { 3.0 } else { 1.5 }, alpha(col, if goal { 0.9 } else { 0.45 }));
+                }
+                if s % 2 == 0 && z > 3.0 {
+                    seg(vec2(ex, y), p, 1.0, alpha(col, 0.05), alpha(col, (z / RALLY_RIDGE_H).min(1.0) * 0.45));
+                }
+                prev = p;
+            }
+            for sy in [-1.0, 1.0] {
+                let gp = vec2(ex, sy * r.goal_half);
+                diamond(gp, 9.0, 2.0, alpha(col, 0.9));
+                line(gp, gp + vec2(rally::fwd(i) * 26.0, 0.0), 2.0, alpha(col, 0.6));
+            }
+        }
+        gl_use_default_material();
+
+        // ---- landing telegraphs on the end line ----
+        for o in r.orbs.iter().filter(|o| o.state == OrbState::Flying) {
+            let k = o.progress(t);
+            let lp = vec2(o.xe, o.land);
+            let live = o.land.abs() <= r.goal_half;
+            let col = if live { mixc(cols[o.owner as usize & 1], WHITE, 0.5 * k) } else { alpha(pal.grid, 0.8) };
+            let sz = RALLY_MARK_R * (1.6 - 0.6 * k);
+            diamond(lp, sz, 2.5, alpha(col, 0.35 + 0.6 * k));
+            if live {
+                diamond_fill(lp, sz * 0.4 * k, alpha(col, 0.9));
+            }
+            let inward = vec2(-o.xe.signum(), 0.0);
+            line(lp + inward * sz, lp + inward * (sz + 40.0 * k), 2.0, alpha(col, 0.5 * k));
+        }
+
+        // ---- avatars: reach ghost, live swing arc, mini spectrum, body ----
+        for (i, p) in r.players.iter().enumerate() {
+            let c = cols[i];
+            let aa = p.aim.y.atan2(p.aim.x);
+            disc(p.pos, 34.0, 18, alpha(pal.bg0, 0.5));
+            arc(p.pos, SWING_R, aa - SWING_HALF, aa + SWING_HALF, 1.2, alpha(c, 0.16));
+            let age = p.swing_age(t);
+            let life = SWING_ACTIVE + RALLY_SWING_FADE;
+            if (0.0..life).contains(&age) {
+                let k = 1.0 - age / life;
+                let sc = if p.perfect { mixc(c, WHITE, 0.7) } else { c };
+                arc(p.pos, SWING_R - 12.0, aa - SWING_HALF, aa + SWING_HALF, 24.0, alpha(sc, 0.35 * k));
+                arc(p.pos, SWING_R, aa - SWING_HALF, aa + SWING_HALF, 3.5, alpha(sc, k));
+            }
+            gl_use_material(&self.add_mat);
+            for b in 0..RALLY_SPEC_BARS {
+                let f = b as f32 / RALLY_SPEC_BARS as f32;
+                let v = band(&self.spec_s, (f - 0.5).abs() * 2.0).min(1.2);
+                let d = dir(aa + PI + f * TAU);
+                let a0 = p.pos + d * RALLY_SPEC_R;
+                line(a0, a0 + d * (2.0 + v * RALLY_SPEC_LEN), 2.4, alpha(c, 0.8));
+            }
+            gl_use_default_material();
+            let rr = AVATAR_R * (1.0 + 0.12 * w.beat_pulse);
+            disc2(p.pos, rr * 2.4, 18, alpha(c, 0.3), alpha(c, 0.0));
+            disc(p.pos, rr, 18, c);
+            disc(p.pos, rr * 0.42, 10, alpha(WHITE, 0.95));
+            if p.cd > 0.0 {
+                let frac = 1.0 - (p.cd / rally::SWING_CD).clamp(0.0, 1.0);
+                arc(p.pos, rr + 5.0, -PI * 0.5, -PI * 0.5 + TAU * frac, 1.5, alpha(WHITE, 0.5));
+            }
+            if i == me {
+                arc(p.pos, rr + 9.0, 0.0, TAU, 1.5, alpha(WHITE, 0.55));
+            }
+            let n = vec2(-p.aim.y, p.aim.x);
+            let (tip, base) = (p.pos + p.aim * (rr + 16.0), p.pos + p.aim * (rr + 7.0));
+            geo(&[vtx(tip, c), vtx(base + n * 5.0, c), vtx(base - n * 5.0, c)], &[0, 1, 2]);
+        }
+
+        // ---- orbs: waveform trail, dark backing, white core (always the brightest thing) ----
+        let gain = 1.0 / self.scope_peak.max(0.12);
+        for o in r.orbs.iter().filter(|o| o.state != OrbState::Dead) {
+            let c = cols[o.owner as usize & 1];
+            if o.state == OrbState::Flying {
+                let laser = o.power == Power::Arc;
+                let n = if laser { RALLY_LASER_N } else { RALLY_TRAIL_N };
+                let mut prev_raw = o.pos;
+                let mut prev = o.pos;
+                for k in 1..=n {
+                    let tk = t - k as f32 * RALLY_TRAIL_DT;
+                    if tk < o.t0 {
+                        break;
+                    }
+                    let q = o.eval(tk);
+                    let d = (prev_raw - q).normalize_or_zero();
+                    let fall = 1.0 - k as f32 / n as f32;
+                    let v = if self.scope_ok {
+                        (self.scope[(k * SCOPE_N / n).min(SCOPE_N - 1)] * gain).clamp(-1.5, 1.5)
+                    } else {
+                        0.35 * (k as f32 * 0.9 - self.clock * 18.0).sin()
+                    };
+                    let pq = q + vec2(-d.y, d.x) * v * RALLY_TRAIL_AMP * fall.sqrt();
+                    if laser {
+                        line(prev_raw, q, 9.0 * fall, alpha(c, 0.18 * fall));
+                        line(prev_raw, q, 2.5, alpha(mixc(c, WHITE, 0.6), 0.85 * fall));
+                    }
+                    line(prev, pq, 1.0 + 3.0 * fall, alpha(mixc(c, WHITE, 0.25), 0.9 * fall));
+                    prev_raw = q;
+                    prev = pq;
+                }
+            }
+            let sc = if o.extra { 0.8 } else { 1.0 };
+            let orr = ORB_R * sc * (1.0 + 0.1 * w.beat_pulse);
+            disc(o.pos, orr * 2.6, 20, alpha(BLACK, 0.55));
+            disc2(o.pos, orr * 3.4, 20, alpha(c, 0.45), alpha(c, 0.0));
+            disc(o.pos, orr, 20, WHITE);
+            arc(o.pos, orr + 5.0 + 4.0 * w.beat_pulse, 0.0, TAU, if o.power == Power::Sub { 4.5 } else { 2.0 }, c);
+            if o.power == Power::Tick {
+                poly_lines(o.pos, 4, orr + 11.0, self.time * 6.0, 1.5, alpha(c, 0.8));
+            }
+            if o.state == OrbState::Held {
+                let k = ((t - o.t0) / (o.t1 - o.t0).max(0.01)).clamp(0.0, 1.0);
+                arc(o.pos, orr + 14.0, -PI * 0.5, -PI * 0.5 + TAU * (1.0 - k), 2.5, alpha(c, 0.9));
+            }
+        }
+
+        // ---- one-shot flashes ----
+        gl_use_material(&self.add_mat);
+        for e in r.events() {
+            let age = t - e.t;
+            let c = cols[e.who as usize & 1];
+            let life = match e.kind {
+                FxKind::Slam | FxKind::Score => RALLY_SLAM_LIFE,
+                _ => RALLY_FLASH_LIFE,
+            };
+            if age < 0.0 || age >= life {
+                continue;
+            }
+            let k = 1.0 - age / life;
+            match e.kind {
+                FxKind::Hit => arc(e.pos, 16.0 + age * 260.0, 0.0, TAU, 2.0, alpha(c, 0.6 * k)),
+                FxKind::Bounce => arc(e.pos, 14.0 + age * 200.0, 0.0, TAU, 1.5, alpha(pal.grid, k)),
+                FxKind::Perfect => {
+                    disc2(e.pos, 40.0 + 40.0 * (1.0 - k), 20, alpha(WHITE, 0.5 * k), alpha(c, 0.0));
+                    arc(e.pos, 20.0 + age * 520.0, 0.0, TAU, 3.0 * k + 1.0, alpha(WHITE, k));
+                }
+                FxKind::Slam => {
+                    arc(e.pos, age * RALLY_SLAM_SPEED, 0.0, TAU, 8.0 * k, alpha(c, 0.8 * k));
+                    arc(e.pos, age * RALLY_SLAM_SPEED * 0.6, 0.0, TAU, 3.0 * k, alpha(WHITE, 0.5 * k));
+                }
+                FxKind::Split => {
+                    arc(e.pos, 10.0 + age * 300.0, -0.6, 0.6, 2.5, alpha(c, k));
+                    arc(e.pos, 10.0 + age * 300.0, PI - 0.6, PI + 0.6, 2.5, alpha(c, k));
+                }
+                FxKind::Score => {
+                    line(vec2(e.pos.x, -r.goal_half), vec2(e.pos.x, r.goal_half), 12.0 * k, alpha(c, 0.7 * k));
+                    arc(e.pos, 30.0 + age * 900.0, 0.0, TAU, 6.0 * k, alpha(c, k));
+                }
+                FxKind::Serve => arc(e.pos, ORB_R + 90.0 * k, 0.0, TAU, 2.0, alpha(c, 1.0 - k)),
+            }
+        }
+        gl_use_default_material();
+        for e in r.events() {
+            let age = t - e.t;
+            if e.kind == FxKind::Perfect && (0.0..RALLY_FLASH_LIFE * 2.0).contains(&age) {
+                let k = 1.0 - age / (RALLY_FLASH_LIFE * 2.0);
+                wtext("PERFECT", e.pos - vec2(0.0, 44.0 + 30.0 * (1.0 - k)), 22.0, alpha(WHITE, k), tscale);
+            }
+        }
+    }
+
+    /// Score HUD (screen space, vector font): scores in each player's colour, character names,
+    /// a YOU tag, and a serve prompt for the local player.
+    fn draw_rally_hud(&self, r: &Rally, me: usize) {
+        let (sw, sh) = (screen_width(), screen_height());
+        let u = sh / 1080.0;
+        let cols = [rally_col(r.players[0].ch), rally_col(r.players[1].ch)];
+        let (cx, y) = (sw * 0.5, 84.0 * u);
+        let s = r.score();
+        vtext(&s[0].to_string(), cx - 44.0 * u, y, 64.0 * u, cols[0], 1);
+        vtext("-", cx, y - 8.0 * u, 36.0 * u, alpha(WHITE, 0.6), 0);
+        vtext(&s[1].to_string(), cx + 44.0 * u, y, 64.0 * u, cols[1], -1);
+        for i in 0..2 {
+            let x = cx + rally::fwd(i) * -44.0 * u;
+            let al = if i == 0 { 1 } else { -1 };
+            vtext(r.players[i].ch.name(), x, y + 34.0 * u, 18.0 * u, alpha(cols[i], 0.85), al);
+            if i == me {
+                vtext("YOU", x, y + 58.0 * u, 15.0 * u, alpha(WHITE, 0.8), al);
+            }
+        }
+        if r.goal_half > GOAL_HALF + 20.0 {
+            vtext("GOALS WIDEN", cx, y + 92.0 * u, 18.0 * u, alpha(self.pal.accent, 0.9), 0);
+        }
+        if r.orbs.iter().any(|o| o.state == OrbState::Held && o.owner as usize == me) {
+            let blink = 0.6 + 0.4 * (self.time * 6.0).sin();
+            vtext("YOUR SERVE - SWING ON THE BEAT", cx, sh - 60.0 * u, 24.0 * u, alpha(WHITE, blink), 0);
+        }
+    }
+
+    // -----------------------------------------------------------------------------------------
     // HUD (screen space)
     // -----------------------------------------------------------------------------------------
 
@@ -2536,6 +3164,29 @@ impl Renderer {
 
 fn rect_lines_c(c: Vec2, half: f32, th: f32, col: Color) {
     rect_lines(c.x - half, c.y - half, half * 2.0, half * 2.0, th, col);
+}
+
+// Rally look
+const RALLY_COLS: [u32; 4] = [0xff3d8b, 0xffb22e, 0x3dffc5, 0x5aa9ff]; // Sub, Crack, Tick, Arc
+const RALLY_RIDGE_PTS: usize = 72; // vertices per end-line ridge
+const RALLY_RIDGE_H: f32 = 120.0; // px of rise at an orb's landing point as it arrives
+const RALLY_RIDGE_SIG: f32 = 110.0; // px, width of that rise
+const RALLY_RIDGE_SPEC: f32 = 16.0; // px, spectrum texture on the end lines
+const RALLY_MARK_R: f32 = 16.0; // px, landing telegraph diamond (at arrival)
+const RALLY_SWING_FADE: f32 = 0.08; // s the swing arc lingers after it closes
+const RALLY_SPEC_BARS: usize = 16; // mini spectrum around each avatar
+const RALLY_SPEC_R: f32 = 24.0;
+const RALLY_SPEC_LEN: f32 = 18.0;
+const RALLY_TRAIL_N: usize = 36; // orb trail samples
+const RALLY_LASER_N: usize = 90; // Arc's longer laser trail
+const RALLY_TRAIL_DT: f32 = 0.008; // s between trail samples
+const RALLY_TRAIL_AMP: f32 = 14.0; // px, waveform displacement of the trail
+const RALLY_FLASH_LIFE: f32 = 0.35; // s, hit / perfect flashes
+const RALLY_SLAM_LIFE: f32 = 0.6; // s, Sub shockwave and score flash
+const RALLY_SLAM_SPEED: f32 = 900.0; // px/s
+
+fn rally_col(c: Character) -> Color {
+    hex(RALLY_COLS[c.index() as usize % RALLY_COLS.len()])
 }
 
 fn slot(pal: &Palette, c: u8) -> Color {

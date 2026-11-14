@@ -19,6 +19,9 @@ Run `heartline.exe`. The menu plays music straight away: your **music library** 
   through a second output device; sound effects are off in live mode).
 - **SYNC OFFSET** — if attacks land before you hear the beat (soundbars and Bluetooth add
   lag), raise it; if they land late, lower it.
+- **VISUALS** — FULL / SUBTLE / OFF: how hard the scene pulses with the music (kick zoom
+  punches, grid ripples, snare rings, the waveform ring around the Heart, build-up and drop
+  hits). Choose SUBTLE or OFF if motion or flashing bothers you.
 
 Settings are saved in `heartline.cfg` next to the exe.
 
@@ -58,6 +61,23 @@ White square bullets can be shot down; hot round ones must be dodged. Shards fil
 when it fills, three upgrade orbs appear — fly into one (every upgrade also heals 1). Empty the
 Heart's bar before the song ends for a big bonus and a victory lap.
 
+## LAN Rally (two PCs)
+
+A beat-locked paddle duel on the host's song. Both PCs must be on the same network.
+
+- **Host:** menu → `LAN RALLY` → `HOST A MATCH`. The lobby shows your IP. Pick the song with
+  Q / E (library) or O (any file), pick a character with LEFT / RIGHT, and press ENTER (ready).
+  The song is then sent to the other PC (up to 200 MB).
+- **Join:** menu → `LAN RALLY` → `JOIN A MATCH`. Hosts on your network are listed. Otherwise
+  type the host's IP on the `TYPE AN IP` row and press ENTER. Pick a character and press ENTER.
+- When both players are ready and the song is analysed on both PCs, a 3-second countdown starts
+  the music on both at the same moment. WASD moves, the mouse aims, and click or SPACE swings.
+- There is no pause: ESC asks whether to leave. If either PC leaves or the connection drops for
+  3 seconds, the other returns to the menu with a message.
+- **Windows Firewall** asks the first time you host (and sometimes when you join). Allow
+  Heartline on **Private networks**. Heartline never changes firewall settings itself.
+  It uses TCP port 47820 for the game and UDP port 47821 to find hosts.
+
 ## Command line
 
 ```
@@ -72,6 +92,11 @@ Developer:
   --live-probe SECS                      list devices and test loopback capture (headless)
   --selftest DIR --shots a,b,c --secs N  bot plays, screenshots saved to DIR (add --wall for
                                          wall-clock shot times, --mortal to let the bot die)
+  --lan-host FILE | --lan-join IP[:PORT] [--rally-bot]
+                                         start a LAN Rally session; with --rally-bot the local
+                                         player is the bot (auto character + ready). With
+                                         --selftest DIR, state changes and the final score go to
+                                         DIR\lan.log
   --sim FILES|FOLDER [--sample N] [--bot-delay MS] [--runs N]
                                          headless balance run: hits per minute, deaths, sources
 ```
