@@ -1202,6 +1202,8 @@ pub struct Renderer {
     pal_to: u8,
     pal_t: f32,
     pub time: f32,
+    /// Menu-like screen: the vista is shown without the player, the Heart or the big heartline.
+    pub menu: bool,
     pub view: View,
     // camera / projection
     cam_s: Vec2,
@@ -1359,6 +1361,7 @@ impl Renderer {
             pal_from: pal,
             pal_to: 0,
             pal_t: 1.0,
+            menu: false,
             time: 0.0,
             view: View { sw: screen_width(), sh: screen_height(), scale: 1.0, center: Vec2::ZERO },
             cam_s: Vec2::ZERO,
@@ -1811,7 +1814,9 @@ impl Renderer {
             self.draw_hazards(world, lv);
         }
         gl_use_material(&self.add_mat);
-        self.draw_heart(world, e, progress);
+        if !(self.menu && e > 0.5) {
+            self.draw_heart(world, e, progress);
+        }
         gl_use_default_material();
         if let Some((r, me)) = rally {
             self.draw_rally_world(r, world, me, tscale);
@@ -1828,7 +1833,9 @@ impl Renderer {
                 self.draw_bullets(world, lv);
             }
             self.draw_shots(world);
-            self.draw_player(world);
+            if !self.menu {
+                self.draw_player(world);
+            }
         }
         gl_use_material(&self.add_mat);
         self.draw_particles(world);
@@ -2012,7 +2019,8 @@ impl Renderer {
                 let f = i as f32 / P as f32;
                 let head = smooth(0.85, 1.0, f);
                 let col = mixc(pal.primary, WHITE, head * 0.6 + v.max(0.0) * 0.5);
-                let a = (bright * lv + e * (0.25 + 0.75 * smooth(0.0, 0.25, f))) * (0.75 + 0.25 * head);
+                let vista_a = if self.menu { 0.0 } else { 1.0 };
+                let a = (bright * lv + vista_a * e * (0.25 + 0.75 * smooth(0.0, 0.25, f))) * (0.75 + 0.25 * head);
                 line(prev, p, 2.6 + 1.2 * e, alpha(col, a));
                 if e > 0.02 {
                     line(prev, p, 9.0, alpha(pal.primary, 0.12 * a * e));
