@@ -300,6 +300,9 @@ struct LiveRun {
     ibis: VecDeque<f32>,
 }
 
+/// Menu music plays at this fraction of the in-run music volume.
+const MENU_MUSIC_GAIN: f32 = 0.5;
+
 const DIFFS: [(f32, &str); 3] = [(0.65, "CHILL  (no-fail)"), (1.0, "NORMAL"), (1.35, "HARD")];
 /// Menu VISUALS setting: scale of the renderer's music-reactive pulse layer.
 const VISUALS: [(f32, &str); 3] = [(1.0, "FULL"), (0.45, "SUBTLE"), (0.0, "OFF")];
@@ -321,6 +324,8 @@ struct App {
     diff: usize,
     volume: f32,
     sfx_volume: f32,
+    /// Smoothed music gain (menu duck, death fade).
+    music_gain: f32,
     /// Extra audio latency in ms (soundbars, Bluetooth): events are delayed by this much.
     offset_ms: f32,
     music_dir: Option<PathBuf>,
@@ -2228,6 +2233,7 @@ async fn run(args: Args) {
         diff,
         volume: 0.8,
         sfx_volume: 0.5,
+        music_gain: MENU_MUSIC_GAIN,
         offset_ms: 0.0,
         music_dir: None,
         juke: Jukebox { list: Vec::new(), idx: 0, loaded: None, loader: None, cursor: 0, last_t: -1.0, playing: false, fails: 0 },
@@ -2438,6 +2444,12 @@ async fn run(args: Args) {
             app.lan_draw(dt);
         } else {
             app.feed_signal();
+            // Menu-like screens: no player or Heart in the vista, and the music sits lower than in a run.
+            let in_run = matches!(app.screen, Screen::Play | Screen::Paused);
+            app.rend.menu = !in_run;
+            let duck_to = if in_run { if matches!(app.phase, Phase::Dying(_)) { 0.35 } else { 1.0 } } else { MENU_MUSIC_GAIN };
+            app.music_gain += (duck_to - app.music_gain).clamp(-1.5 * dt, 1.5 * dt);
+            app.audio.set_volume(if app.args.mute { 0.0 } else { app.volume * app.music_gain });
             app.rend.draw_scene(&app.world, dt, app.idle, progress);
             app.rend.draw_hud(&app.world, &hud, app.idle);
         }
@@ -2465,21 +2477,49 @@ async fn run(args: Args) {
                     "LIVE AUDIO   (what your PC is playing)".to_string(),
                     "LAN RALLY   (two PCs, same network)".to_string(),
                     format!("DIFFICULTY   {}", DIFFS[app.diff].1),
-                    format!("MUSIC VOLUME   {:.0}%", app.volume * 100.0),
-                    format!("EFFECTS VOLUME   {:.0}%", app.sfx_volume * 100.0),
+                    "MUSIC VOLUME".to_string(),
+                    "EFFECTS VOLUME".to_string(),
                     format!("SYNC OFFSET   {:+.0} ms", app.offset_ms),
                     format!("VISUALS   {}", VISUALS[app.visuals].1),
                     format!("DISPLAY   {}", if app.fullscreen { "BORDERLESS FULLSCREEN" } else { "WINDOWED" }),
                     "QUIT".to_string(),
                 ];
                 let act = if app.dialog.is_none() { menu_list(&items, &mut app.menu_sel, 110.0 * u, 256.0 * u, u, &app.rend, &app.audio) } else { None };
+                // Volume rows are sliders: drag with the mouse, or Left / Right.
+                let act = match act {
+                    Some(8) | Some(9) => None,
+                    a => a,
+                };
+                let mut slid = false;
+                for (row, is_sfx) in [(8usize, false), (9usize, true)] {
+                    let by = 256.0 * u + row as f32 * 54.0 * u;
+                    let (tx, tw) = (110.0 * u + 262.0 * u, 176.0 * u);
+                    let ty = by + 23.0 * u;
+                    let v = if is_sfx { app.sfx_volume } else { app.volume };
+                    let on = app.menu_sel == row;
+                    let col = if on { pal.accent } else { pal.primary };
+                    draw_rectangle(tx, ty - 1.5 * u, tw, 3.0 * u, Color::new(1.0, 1.0, 1.0, 0.22));
+                    draw_rectangle(tx, ty - 1.5 * u, tw * v, 3.0 * u, col);
+                    draw_circle(tx + tw * v, ty, if on { 8.0 } else { 6.0 } * u, WHITE);
+                    draw_circle_lines(tx + tw * v, ty, if on { 11.0 } else { 9.0 } * u, 1.5 * u, col);
+                    text_left(&format!("{:.0}%", v * 100.0), tx + tw + 20.0 * u, by + 31.0 * u, 22.0 * u, Color::new(1.0, 1.0, 1.0, 0.85));
+                    let (mx, my) = mouse_position();
+                    if app.dialog.is_none() && is_mouse_button_down(MouseButton::Left) && my >= by && my <= by + 46.0 * u && mx >= tx - 14.0 * u && mx <= tx + tw + 14.0 * u {
+                        let nv = (((mx - tx) / tw).clamp(0.0, 1.0) * 20.0).round() / 20.0;
+                        if (nv - v).abs() > 0.001 {
+                            if is_sfx { app.sfx_volume = nv } else { app.volume = nv }
+                            app.menu_sel = row;
+                            slid = true;
+                        }
+                    }
+                }
                 // left/right adjusts the selected row; on the play rows it changes the track
                 let dirk = is_key_pressed(KeyCode::Right) as i32 - is_key_pressed(KeyCode::Left) as i32;
                 let track_dirk = is_key_pressed(KeyCode::E) as i32 - is_key_pressed(KeyCode::Q) as i32 + if app.menu_sel <= 1 { dirk } else { 0 };
                 if track_dirk != 0 && app.dialog.is_none() {
                     app.juke_next(track_dirk);
                 }
-                let mut changed = false;
+                let mut changed = slid;
                 if dirk != 0 {
                     changed = true;
                     match app.menu_sel {
@@ -2554,9 +2594,8 @@ async fn run(args: Args) {
                 }
                 if changed {
                     let mute = app.args.mute;
-                    app.audio.set_volume(if mute { 0.0 } else { app.volume });
                     app.audio.set_sfx_volume(if mute { 0.0 } else { app.sfx_volume });
-                    if app.menu_sel == 9 {
+                    if app.menu_sel == 9 && !is_mouse_button_down(MouseButton::Left) || (slid && is_mouse_button_pressed(MouseButton::Left)) {
                         app.audio.sfx(Sfx::Shard, 1.0, 0.0);
                     }
                     app.save_settings();
