@@ -179,13 +179,13 @@ fn sim_report(args: &Args) {
         return;
     }
     let delay = args.bot_delay / 1000.0;
-    let diffs: Vec<usize> = if args.diff_set { vec![args.diff] } else { vec![0, 1, 2] };
+    let diffs: Vec<usize> = if args.diff_set { vec![args.diff] } else { (0..crate::DIFFS.len()).collect() };
     println!("bot reaction delay {:.0} ms, {} run(s) per difficulty; death = first death time, the bot is revived to finish the song", args.bot_delay, args.runs.max(1));
     println!("{:<26} {:>4} {:>4} {:<6} {:>5} {:>4} {:>4} {:>19} {:>17} {:>5} {:>3} {:>3} {:>2}  hits per 30 s", "track", "dur", "bpm", "diff", "death", "dths", "hits", "hits/min C/N/I/D", "src b/e/t/l/w/h", "heart", "lvl", "bul", "en");
-    let mut src_tot = [[0u32; 6]; 3];
-    let mut pat_tot = [[0u32; 12]; 3];
-    let mut tile_tot = [[0u32; 9]; 3];
-    let mut totals = [(0u32, 0u32, 0.0f32, 0.0f32); 3];
+    let mut src_tot = [[0u32; 6]; 7];
+    let mut pat_tot = [[0u32; 12]; 7];
+    let mut tile_tot = [[0u32; 9]; 7];
+    let mut totals = [(0u32, 0u32, 0.0f32, 0.0f32); 7];
     for path in &files {
         let progress = AtomicU32::new(0);
         let stage = AtomicU32::new(0);
@@ -226,7 +226,7 @@ fn sim_report(args: &Args) {
                     name,
                     level.duration,
                     level.bpm,
-                    ["chill", "normal", "hard"][di],
+                    crate::DIFFS[di].1,
                     o.first_death.map(|d| format!("{d:.0}s")).unwrap_or_else(|| "-".into()),
                     o.deaths,
                     o.hit_times.len(),
@@ -252,7 +252,7 @@ fn sim_report(args: &Args) {
         if n > 0 {
             println!(
                 "{:<6} runs {:>3}  no-death clears {:>3} ({:>3.0}%)  mean hits/min {:.2}  mean survived fraction {:.2}  hits by src b/e/t/l/w/h {:?}",
-                ["chill", "normal", "hard"][di],
+                crate::DIFFS[di].1,
                 n,
                 clears,
                 clears as f32 * 100.0 / n as f32,

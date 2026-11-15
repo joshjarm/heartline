@@ -2398,7 +2398,7 @@ impl Renderer {
                 gi = j;
             }
         }
-        let za = a * (0.4 + 0.6 * k);
+        let za = a * (0.16 + 0.5 * k * k);
         if gmax < ZONE_MERGE {
             self.circle3(Vec2::ZERO, reach, 0.0, 72, 2.0, alpha(col, za));
             return;
@@ -2428,12 +2428,12 @@ impl Renderer {
         for s in 1..=steps {
             let ang = a0 + (a1 - a0) * s as f32 / steps as f32;
             let (d0, d1) = (dir(prev), dir(ang));
-            quad4([d0 * r0, d1 * r0, d1 * reach, d0 * reach], [alpha(col, 0.30 * a * (0.3 + 0.7 * k)), alpha(col, 0.30 * a * (0.3 + 0.7 * k)), alpha(col, 0.08 * a), alpha(col, 0.08 * a)]);
-            line(d0 * reach, d1 * reach, 2.0, alpha(col, a));
+            quad4([d0 * r0, d1 * r0, d1 * reach, d0 * reach], [alpha(col, 0.34 * a * k), alpha(col, 0.34 * a * k), alpha(col, 0.03 * a), alpha(col, 0.03 * a)]);
+            line(d0 * reach, d1 * reach, 1.2, alpha(col, a * 0.3));
             prev = ang;
         }
-        seg(dir(a0) * r0, dir(a0) * reach, 1.5, alpha(col, a * 0.3), alpha(col, a));
-        seg(dir(a1) * r0, dir(a1) * reach, 1.5, alpha(col, a * 0.3), alpha(col, a));
+        seg(dir(a0) * r0, dir(a0) * reach, 1.2, alpha(col, a * 0.35), alpha(col, 0.0));
+        seg(dir(a1) * r0, dir(a1) * reach, 1.2, alpha(col, a * 0.35), alpha(col, 0.0));
     }
 
     // -----------------------------------------------------------------------------------------
