@@ -100,7 +100,11 @@ fn parse_args() -> Args {
                 a.diff_set = true;
                 a.diff = match val().to_ascii_lowercase().as_str() {
                     "chill" | "0" => 0,
-                    "hard" | "2" => 2,
+                    "hard" | "2" | "pulse" => 2,
+                    "palpitation" | "3" => 3,
+                    "fever" | "4" => 4,
+                    "arrhythmia" | "5" => 5,
+                    "flatline" | "6" => 6,
                     _ => 1,
                 }
             }
@@ -303,7 +307,17 @@ struct LiveRun {
 /// Menu music plays at this fraction of the in-run music volume.
 const MENU_MUSIC_GAIN: f32 = 0.5;
 
-const DIFFS: [(f32, &str); 3] = [(0.65, "CHILL  (no-fail)"), (1.0, "NORMAL"), (1.35, "HARD")];
+/// Difficulty tiers: (budget multiplier, name, what changes). Steps are small on purpose.
+/// Tier 0 is no-fail; the last tier starts with a single life (see `App::apply_diff_rules`).
+const DIFFS: [(f32, &str, &str); 7] = [
+    (0.7, "LULLABY", "No-fail. Sparse attacks, slow bullets, long warnings."),
+    (1.0, "RESTING", "A gentle run: room to learn every pattern."),
+    (1.35, "PULSE", "The intended run. Denser patterns, lasers and tile strikes may overlap."),
+    (1.75, "PALPITATION", "Attacks come faster and enemies arrive in numbers."),
+    (2.2, "FEVER", "Big patterns on every beat. Little room to rest."),
+    (2.7, "ARRHYTHMIA", "Near-constant pressure and the widest patterns."),
+    (3.2, "FLATLINE", "One life. Everything at full force. SUSTAIN upgrades are the only way to earn more."),
+];
 /// Menu VISUALS setting: scale of the renderer's music-reactive pulse layer.
 const VISUALS: [(f32, &str); 3] = [(1.0, "FULL"), (0.45, "SUBTLE"), (0.0, "OFF")];
 
@@ -494,6 +508,14 @@ fn beat_pos(beats: &[f32], t: f32) -> f32 {
 }
 
 impl App {
+    /// Tier-specific rules beyond the budget multiplier.
+    fn apply_diff_rules(&mut self) {
+        if self.diff == DIFFS.len() - 1 {
+            self.world.player.hp = 1;
+            self.world.player.max_hp = 1;
+        }
+    }
+
     fn diff(&self) -> f32 {
         DIFFS[self.diff].0
     }
@@ -701,6 +723,7 @@ impl App {
         self.qi = 0;
         let god = self.args.selftest.is_some() && !self.args.mortal;
         self.world = World::new(self.diff(), self.diff == 0 || god);
+        self.apply_diff_rules();
         for _ in 0..self.args.give {
             let up = UpgradeId::ALL[self.world.rng.below(UpgradeId::ALL.len())];
             self.world.player.ups[up as usize] = (self.world.player.ups[up as usize] + 1).min(up.max());
@@ -723,6 +746,7 @@ impl App {
         self.audio.start_live(capture, playback, delay);
         self.song = None;
         self.world = World::new(self.diff(), self.diff == 0);
+        self.apply_diff_rules();
         self.world.begin_song(210.0, 0, 0xC0FFEE);
         let lookahead = if delayed { (delay - 0.25).max(0.0) } else { 0.0 };
         let seed = std::time::SystemTime::now()
@@ -2263,7 +2287,7 @@ async fn run(args: Args) {
     let cfg = load_settings();
     let getf = |k: &str, d: f32| -> f32 { cfg.get(k).and_then(|v| v.parse().ok()).unwrap_or(d) };
     if !args.diff_set {
-        app.diff = (getf("diff", 1.0) as usize).min(2);
+        app.diff = (getf("diff", 2.0) as usize).min(DIFFS.len() - 1);
     }
     app.volume = getf("volume", 0.8).clamp(0.0, 1.0);
     app.sfx_volume = getf("sfx", 0.5).clamp(0.0, 1.0);
@@ -2523,7 +2547,7 @@ async fn run(args: Args) {
                 if dirk != 0 {
                     changed = true;
                     match app.menu_sel {
-                        7 => app.diff = ((app.diff as i32 + dirk).rem_euclid(3)) as usize,
+                        7 => app.diff = ((app.diff as i32 + dirk).rem_euclid(DIFFS.len() as i32)) as usize,
                         8 => app.volume = (app.volume + 0.1 * dirk as f32).clamp(0.0, 1.0),
                         9 => app.sfx_volume = (app.sfx_volume + 0.1 * dirk as f32).clamp(0.0, 1.0),
                         10 => app.offset_ms = (app.offset_ms + 10.0 * dirk as f32).clamp(-100.0, 300.0),
@@ -2565,7 +2589,7 @@ async fn run(args: Args) {
                     }
                     Some(6) => app.lan_open(),
                     Some(7) => {
-                        app.diff = (app.diff + 1) % 3;
+                        app.diff = (app.diff + 1) % DIFFS.len();
                         changed = true;
                     }
                     Some(8) => {
@@ -2610,6 +2634,7 @@ async fn run(args: Args) {
                 app.rend.draw_now_playing(sw - 700.0 * u, 110.0 * u, 590.0 * u, u, &app.world, &title, &hint, progress);
                 let hy = sh - 60.0 * u;
                 let help = match app.menu_sel {
+                    7 => DIFFS[app.diff].2,
                     11 => "VISUALS: how hard the scene pulses with the music (zoom punches, flashes, rings). SUBTLE or OFF for comfort",
                     6 => "LAN RALLY: a beat-locked paddle duel against a second PC on your network; the host picks the song",
                     10 => "SYNC OFFSET: raise it if attacks land before you hear the beat (soundbar / Bluetooth lag), lower it if they land late",
