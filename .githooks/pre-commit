@@ -1,0 +1,14 @@
+#!/bin/sh
+# Block commits directly on main. Work on a branch and merge through a pull request.
+# (Enable once per clone: git config core.hooksPath .githooks)
+branch=$(git symbolic-ref --short HEAD 2>/dev/null)
+if [ "$branch" = "main" ] || [ "$branch" = "master" ]; then
+    echo "" >&2
+    echo "  Blocked: don't commit directly to '$branch'." >&2
+    echo "  Make a branch for this work first, e.g.:" >&2
+    echo "      git switch -c feat/short-name" >&2
+    echo "  then commit, push it, and open a pull request." >&2
+    echo "" >&2
+    exit 1
+fi
+exit 0
