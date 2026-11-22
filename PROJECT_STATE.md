@@ -106,8 +106,8 @@ Build / run / test:
   rustfft 6, rfd 0.18. No C dependencies. Original code/art only.
 - 2026-11-14 — Agent workflow used this session: no git repo here, so each agent got a full copy
   of the project in `tmp/agents/<name>/` (own `target/`) and owned exactly one file to merge back
-  (`analysis.rs`, `synth.rs`, `render.rs`). Role briefs live in `.claude/agents/*.md` (some
-  details there are stale: no `docs/plans/`, no network code). The copies were deleted after
+  (`analysis.rs`, `synth.rs`, `render.rs`). Each agent worked from a written role brief (since
+  removed from the repo). The copies were deleted after
   merging. Agents ran on Opus and hit the account's usage limit twice mid-task; the graphics
   agent never wrote a final report (its file was complete enough to merge).
 - 2026-11-14 — Difficulty is tuned with `--sim`, not by feel: the delayed bot at 120–200 ms died

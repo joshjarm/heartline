@@ -122,9 +122,9 @@ Duet co-op, Heart vs Runner, Crossfire, best-of-N song matches, a spectator view
   snapshots arrived with 0 bad, and traffic was about 15 KB/s. The connect failures stopped after
   the user turned off Windows Firewall, so a firewall allow rule for heartline.exe is needed.
 - **Earlier note:** every loopback TCP connect
-  fails with WSAEACCES when started from inside the Claude desktop app (even its terminal panel).
+  fails with WSAEACCES when started from inside the desktop coding app (even its terminal panel).
   The host listens fine (`0.0.0.0:47820`).
-  - Test from a normal PowerShell window outside Claude:
+  - Test from a normal PowerShell window outside that app:
     `powershell -ExecutionPolicy Bypass -File tmp\lan-test.ps1`
   - Pass = both `tmp\h\lan.log` and `tmp\c\lan.log` end with the same final score and show no
     `leave:` line.
