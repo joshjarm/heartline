@@ -1,13 +1,48 @@
 # Heartline
 
-_Your music is the level._ A top-down vaporwave bullet-hell where every song becomes a seeded,
-repeatable arena fight against **the Heart** — a wireframe construct that pulses and fires with the
-music. Written in Rust (macroquad + cpal + symphonia + rustfft). See `DESIGN.md` for the plan.
+> **Your music is the level.**
+
+Drop in a song and fight it. Heartline listens to your music (kicks, snares, hi-hats, sustained
+notes, bars, build-ups and drops) and turns it into a seeded, repeatable arena fight against
+**the Heart**, a neon wireframe construct that pulses, aims and fires in time with the track.
+Every attack is announced on the floor before it lands on the beat, so the fight is a dance you
+can read, not a wall of bullets. The same song always gives the same fight.
+
+Written in Rust (macroquad, cpal, symphonia, rustfft). Windows, no installer, no extra DLLs.
+
+> **Project status.** This public repository is a snapshot of **Heartline 0.3.0**. The game is
+> still in active development, but day-to-day work now happens in a private repository, so
+> this one only gets occasional updates and may trail the latest build.
+
+## Highlights
+
+- **Any song becomes a level.** mp3, flac, ogg, wav, m4a and aac are analysed in-process
+  (band energies, onsets, tempo, beats, bars, sections, silences). No external tools, no cloud.
+- **The Heart plays the song.** Kicks make it fire announced patterns (cones, walls with a
+  gap, pincers, crosses), snares call in enemies, hi-hats lay shard trails, sustained notes
+  sweep lasers across the arena, bar lines slam down tile strikes, and drops send a
+  shockwave and an elite.
+- **Fair by design.** Difficulty is per second, not per song, so a slow track gets fewer,
+  bigger moves and a fast one more, smaller ones. Every song starts gently, ramps up, and backs
+  off for a few seconds when you take a hit.
+- **Seven difficulty tiers** on a heart-rate theme, from the no-fail LULLABY to the one-life
+  FLATLINE.
+- **Roguelike runs.** Chain a song plus four more with SHUFFLE RUN: HP, upgrades and score
+  carry over and the Heart gets tougher each track. Ten upgrades (TEMPO, CHORD, GAIN, PIERCE,
+  SUSTAIN, GLIDE, PHASE, MAGNET, ECHO, ENCORE).
+- **Live audio mode.** Play against whatever your PC is playing right now, reactive or with a
+  delayed look-ahead through a second output device.
+- **LAN Rally.** A beat-locked, two-PC paddle duel on the host's song.
+- **Vaporwave look and sound.** Neon line art with depth, a synthwave sunset menu that reacts to
+  the music, and three built-in synthwave tracks so it works before you point it at your library.
+- **Accessible.** A VISUALS setting (FULL / SUBTLE / OFF) tones down pulsing and flashing.
 
 ## Play
 
-Run `heartline.exe`. The menu plays music straight away: your **music library** folder
-(shuffled) or, until one is set, three built-in synthwave tracks. `Q` / `E` change the track.
+Download `heartline.exe` from the [latest release](https://github.com/joshjarm/heartline/releases/latest) (or build it yourself,
+see [Build](#build)) and run it. The menu plays music straight away: your **music library**
+folder (shuffled) or, until one is set, three built-in synthwave tracks. `Q` / `E` change the
+track.
 
 - **PLAY THIS TRACK** — fight the song the menu is playing (it is already analysed, so it
   starts instantly). **SHUFFLE RUN** — that track plus four more as one roguelike run: HP,
@@ -61,6 +96,21 @@ White square bullets can be shot down; hot round ones must be dodged. Shards fil
 when it fills, three upgrade orbs appear — fly into one (every upgrade also heals 1). Empty the
 Heart's bar before the song ends for a big bonus and a victory lap.
 
+## Difficulty
+
+Pick a tier in the menu (or with `--diff`). Only the attack budget changes between tiers, so a
+song feels like the same song at every step.
+
+| Tier | What you get |
+|---|---|
+| LULLABY | No-fail. Sparse attacks, slow bullets, long warnings. |
+| RESTING | A gentle run: room to learn every pattern. |
+| PULSE | The intended run. Denser patterns; lasers and tile strikes may overlap. |
+| PALPITATION | Attacks come faster and enemies arrive in numbers. |
+| FEVER | Big patterns on every beat. Little room to rest. |
+| ARRHYTHMIA | Near-constant pressure and the widest patterns. |
+| FLATLINE | One life. Everything at full force. |
+
 ## LAN Rally (two PCs)
 
 A beat-locked paddle duel on the host's song. Both PCs must be on the same network.
@@ -82,7 +132,9 @@ A beat-locked paddle duel on the host's song. Both PCs must be on the same netwo
 
 ```
 heartline.exe [files or folders...]      start a run with these songs
-  --diff chill|normal|hard               difficulty (chill = no-fail)
+  --diff 0-6                             difficulty tier (0 = LULLABY, no-fail ... 6 = FLATLINE);
+                                         names also work: chill, pulse, palpitation, fever,
+                                         arrhythmia, flatline
   --seed N                               vary the generated level (default 0 = canonical)
   --live [--live-in NAME] [--live-out NAME]   start in live mode (device name substrings)
   --mute  --size WxH  --ss 1|2           misc (ss = supersampling)
@@ -103,12 +155,23 @@ Developer:
 
 ## Build
 
-Rust (stable, MSVC) is installed in the user profile but is not on PATH — use `build.bat`, or:
+Heartline targets Windows (live audio uses WASAPI loopback). You need the stable Rust toolchain
+with the MSVC target; install it from <https://rustup.rs>.
 
 ```
-"%USERPROFILE%\.cargo\bin\cargo.exe" build --release
-"%USERPROFILE%\.cargo\bin\cargo.exe" test --release
+cargo build --release
+cargo test --release
 ```
 
-The exe is `target\release\heartline.exe` (statically linked CRT, no extra DLLs).
-If it ever exits silently, look for `heartline-crash.log` next to the exe.
+The exe is `target\release\heartline.exe` (statically linked CRT, no extra DLLs). If it ever
+exits silently, look for `heartline-crash.log` next to the exe.
+
+`build.bat` does the same build for setups where Rust is installed per-user and `cargo` is not
+on your `PATH`.
+
+## Learn more
+
+- [`DESIGN.md`](DESIGN.md): the design plan and the audio-to-level pipeline.
+- [`docs/plans/`](docs/plans): plans for live audio, LAN Rally and 0.3.
+- Heartline takes inspiration from Solus Heart (Risk of Rain 2), WindowKill and vaporwave /
+  synthwave art. All code and art here are original and procedural.
