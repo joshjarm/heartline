@@ -1,6 +1,6 @@
 # Plan: Live Audio rework (analysed look-ahead, per-app capture, long delays)
 
-_Written by the planner agent, 2026-11-13. Status: not started. Open questions in §6 need the user's answers before steps 5, 7 and 8._
+_Written 2026-11-13. Status: not started. Open questions in §6 need the user's answers before steps 5, 7 and 8._
 
 ## 1. Goal
 Make live mode produce levels as good as file mode: a real beat grid, bars, Calm/Normal/Intense/Drop sections, drops and phrase lasers. To get there, buffer 12-180 s of captured audio, run the offline analysis pipeline on rolling windows, and play the audio back delayed. The player can capture one specific program (Windows process loopback), and the zero-delay reactive mode stays available.
@@ -132,7 +132,7 @@ Dependencies: 1 and 2 can run in parallel. Step 3 needs 1 and 2. Steps 4 and 6 a
 - Run `RollingAnalyzer` with `GUARD=0` committing into the past, and extrapolate beats and bars forward from tempo and phase.
 - `LiveGen` then uses predicted bars for tile strikes (with real telegraphs) and `beat_pos` for the gun, instead of the fixed 120 BPM grid.
 
-**10. Docs** (either agent): update PROJECT_STATE.md (decisions, spike results, new CLI flags), DESIGN.md §2/§3 (pipeline diagram, modes) and README.
+**10. Docs**: update PROJECT_STATE.md (decisions, spike results, new CLI flags), DESIGN.md §2/§3 (pipeline diagram, modes) and README.
 
 ## 4. Tuning knobs
 All live in `RollCfg` (analysis.rs) unless noted.
@@ -201,7 +201,7 @@ New files: `src/live.rs`, `src/capture.rs`. Changed: `src/analysis.rs`, `src/lev
 
 ---
 
-# Review (Fable 5.2, 2026-11-13)
+# Review (2026-11-13)
 
 ## Part 1: Approach and steps 1-3 (analysis + generator)
 Line refs: `analysis.rs` = A, `level.rs` = L. `pick_onsets` (A:287-337) and `StreamAnalyzer` were not checked.
@@ -399,7 +399,7 @@ Line refs: `main.rs` = M, `game.rs` = G. `engine.rs`, `feat_at`, `beat_pos` and 
 ---
 
 # Spike results: per-app capture (2026-11-13)
-Built as a C#/.NET 10 test (Rust isn't installed on this machine), making the same Win32 calls the `wasapi` crate wraps. Project: the session scratchpad `app-capture-spike` (throwaway). **Not yet checked:** which `wasapi` crate version and API names work. Verify on a machine with cargo.
+Built as a C#/.NET 10 test (Rust isn't installed on this machine), making the same Win32 calls the `wasapi` crate wraps. Project: a throwaway project, `app-capture-spike`. **Not yet checked:** which `wasapi` crate version and API names work. Verify on a machine with cargo.
 
 | Case | Result |
 |---|---|

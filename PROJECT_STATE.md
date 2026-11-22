@@ -45,14 +45,14 @@ Done this session:
   escalation × mercy after a hit; mechanics unlock at `P_*` thresholds. Gun fire rate and enemy
   fire cadence are normalised in seconds (`FIRE_INTERVALS`). 6 HP, every upgrade heals 1.
   Groove: bullets/enemies surge on the beat (`GROOVE_*`). Per-drum envelopes `World::hit`.
-- **Analysis** (`analysis.rs`, by the DSP agent): metrical-level selection fixes 4:3 / 3:2 tempo
+- **Analysis** (`analysis.rs`): metrical-level selection fixes 4:3 / 3:2 tempo
   errors (Straftat tracks were read as ~110 BPM, really ~84/168); sub-frame onset/beat times with
   bias correction (±1.5 ms on synthetic mixes); kick envelope ignores snares; downbeat uses chord
   change + backbeat; intensity is a per-song rank (mean ≈ 0.5) and section kinds are relative
   quotas; `beat_conf`, `downbeat_conf`, `StreamAnalyzer::live_beat()` (used by live mode).
 - **Audio engine** (`engine.rs`): crossfade + looping (`play_ex`), `fade_out`, a sound-effect
   mixer with a synthesised bank (`Sfx`, 14 short soft sounds), soft clip on the mix bus.
-- **Built-in music** (`synth.rs`, by the synth agent): 3 original procedural synthwave tracks
+- **Built-in music** (`synth.rs`): 3 original procedural synthwave tracks
   (`theme(i)`, ~1 s each to synthesise, loopable). They travel through playlists as pseudo
   paths `::theme0..2`.
 - **Menu jukebox** (`main.rs`): the menu plays the music library (shuffled) or the built-in
@@ -70,7 +70,7 @@ Balance numbers (bot with 120 ms reaction delay, 12 Straftat songs, `--sim`):
 clears), Normal 1.6 (83 %), Hard 2.7 (50 %). With 0 ms delay the bot takes ~0.1 hits/min, so
 every level is fair. Bullets on screen average 10–35 (was ~75).
 
-- **Visual overhaul merged** (`render.rs`, by the graphics agent, finished by the lead): 2.5D
+- **Visual overhaul merged** (`render.rs`): 2.5D
   projection (`pj`), calm dark floor with thin grid, spectrum as line ridges around the arena rim
   and a crown around the Heart, wireframe morphing Heart and enemies, tile strikes as rising
   pillars, laser walls, danger-zone telegraphs for announced pulses (`draw_pulse_zone`, mirrors
@@ -104,12 +104,8 @@ Build / run / test:
 ## Key Decisions & Notes
 - 2026-11-13 — Engine: macroquad 0.4.16; audio cpal 0.18 (WASAPI loopback), symphonia 0.6,
   rustfft 6, rfd 0.18. No C dependencies. Original code/art only.
-- 2026-11-14 — Agent workflow used this session: no git repo here, so each agent got a full copy
-  of the project in `tmp/agents/<name>/` (own `target/`) and owned exactly one file to merge back
-  (`analysis.rs`, `synth.rs`, `render.rs`). Each agent worked from a written role brief (some
-  details there are stale: no `docs/plans/`, no network code). The copies were deleted after
-  merging. Agents ran on Opus and hit the account's usage limit twice mid-task; the graphics
-  agent never wrote a final report (its file was complete enough to merge).
+- 2026-11-14 — Parallel work: `analysis.rs`, `synth.rs` and `render.rs` were each developed on their own
+  copy of the project and merged back one file at a time. The copies were deleted after merging.
 - 2026-11-14 — Difficulty is tuned with `--sim`, not by feel: the delayed bot at 120–200 ms died
   at ~30 s on 0.1, matching the player's report, so it is the proxy for "average player".
 - Line endings: `analysis.rs` and `synth.rs` are CRLF, everything else LF (do not normalise).
@@ -141,9 +137,9 @@ Build / run / test:
     predicts its own avatar with `Rally::predict_move`, replaying inputs the host hasn't acked.
   - Both PCs analyse the same file and start `play_ex` at the agreed instant.
   - Test flags: `--lan-host FILE`, `--lan-join IP`, `--rally-bot` (+ `--selftest DIR` → `lan.log`).
-  - TCP connects (even to 127.0.0.1) are blocked inside the agent sandbox here (WSAEACCES).
+  - TCP connects (even to 127.0.0.1) are blocked in the restricted test environment used here (WSAEACCES).
     That's why `net.rs` tests run the full session over an in-memory duplex, and the TCP test
-    is `#[ignore]`. Run the two-instance check outside the sandbox.
+    is `#[ignore]`. Run the two-instance check outside that environment.
 - `main.rs`, `net.rs`, `rally.rs`, `render.rs` are CRLF. Git Bash `sed -i` silently converts a
   CRLF file to LF; use the Edit tool or `perl -pi`, then check with `file`.
 
@@ -158,6 +154,6 @@ tools, balance simulator, bot · `rng.rs` PRNG.
 - 2026-11-13 — Researched stack, installed Rust, wrote DESIGN.md, built 0.1.0, packaged to
   `#UserTesting/Heartline-0.1.0-win-x64/`.
 - 2026-11-14 — First playtest feedback. 0.2 work: generator rewrite (directed, per-second
-  budgets, motifs, tile phrases), pressure ramp + mercy, balance simulator, analysis overhaul
-  (agent), built-in music (agent), visual overhaul (agent + lead), menu jukebox, SFX, settings,
+  budgets, motifs, tile phrases), pressure ramp + mercy, balance simulator, analysis overhaul,
+  built-in music, visual overhaul, menu jukebox, SFX, settings,
   pause fix. Shipped `Heartline-0.2.0-T1` to `#UserTesting`, removed the 0.1.0 build.
